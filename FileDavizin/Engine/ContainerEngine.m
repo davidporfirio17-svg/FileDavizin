@@ -852,48 +852,84 @@ static NSSet<NSString *> *_findAndParseCSStores(void) {
     };
     int ndirs = sizeof(kStoreDirs) / sizeof(kStoreDirs[0]);
 
-    // Also try InternalDaemon containers (where lsd keeps its csstore)
     NSMutableArray *searchDirs = [NSMutableArray array];
     for (int d = 0; d < ndirs; d++)
         [searchDirs addObject:[NSString stringWithUTF8String:kStoreDirs[d]]];
 
+    // Try InternalDaemon containers (where lsd keeps its csstore)
     NSArray *daemonDirs = @[
         @"/private/var/mobile/Containers/Data/InternalDaemon",
         @"/var/mobile/Containers/Data/InternalDaemon",
     ];
     for (NSString *daemonBase in daemonDirs) {
-        NSArray *uuids = [fm contentsOfDirectoryAtPath:daemonBase error:nil];
+        NSError *err = nil;
+        NSArray *uuids = [fm contentsOfDirectoryAtPath:daemonBase error:&err];
+        NSLog(@"[FD-CS] InternalDaemon scan %@ -> %lu entries (err=%@)",
+              daemonBase, (unsigned long)uuids.count, err);
         for (NSString *uuid in uuids) {
             if (uuid.length < 32 || [uuid hasPrefix:@"."]) continue;
-            NSString *cachePath = [[[daemonBase stringByAppendingPathComponent:uuid]
+            NSString *containerPath = [daemonBase stringByAppendingPathComponent:uuid];
+            NSString *cachePath = [[containerPath
+                                    stringByAppendingPathComponent:@"Library"]
+                                   stringByAppendingPathComponent:@"Caches"];
+            [searchDirs addObject:cachePath];
+            // Also check root of container and Library directly
+            [searchDirs addObject:containerPath];
+            [searchDirs addObject:[containerPath stringByAppendingPathComponent:@"Library"]];
+        }
+    }
+
+    // Also try system container subdirectories
+    NSArray *extraPaths = @[
+        @"/private/var/containers/Data/InternalDaemon",
+        @"/var/containers/Data/InternalDaemon",
+        @"/private/var/mobile/Containers/Data/System",
+    ];
+    for (NSString *base in extraPaths) {
+        NSArray *entries = [fm contentsOfDirectoryAtPath:base error:nil];
+        for (NSString *uuid in entries) {
+            if (uuid.length < 32 || [uuid hasPrefix:@"."]) continue;
+            NSString *cachePath = [[[base stringByAppendingPathComponent:uuid]
                                     stringByAppendingPathComponent:@"Library"]
                                    stringByAppendingPathComponent:@"Caches"];
             [searchDirs addObject:cachePath];
         }
     }
 
+    NSLog(@"[FD-CS] total search dirs: %lu", (unsigned long)searchDirs.count);
+
     int storesFound = 0;
-    NSUInteger largestSize = 0;
+    int dirsAccessible = 0;
 
     for (NSString *dir in searchDirs) {
-        NSArray *contents = [fm contentsOfDirectoryAtPath:dir error:nil];
-        if (!contents) continue;
+        NSError *dirErr = nil;
+        NSArray *contents = [fm contentsOfDirectoryAtPath:dir error:&dirErr];
+        if (!contents) {
+            // Only log the first few to avoid spam
+            if (dirsAccessible == 0 && storesFound == 0) {
+                NSLog(@"[FD-CS] dir FAIL: %@ errno=%d", dir, (int)dirErr.code);
+            }
+            continue;
+        }
+        dirsAccessible++;
         for (NSString *name in contents) {
             if (![name hasPrefix:@"com.apple.LaunchServices-"]) continue;
             if (![name hasSuffix:@".csstore"]) continue;
             NSString *storePath = [dir stringByAppendingPathComponent:name];
             NSData *data = [NSData dataWithContentsOfFile:storePath];
+            NSLog(@"[FD-CS] FOUND store: %@ bytes=%lu at %@",
+                  name, (unsigned long)data.length, dir);
             if (!data || data.length < 100) continue;
             storesFound++;
-            FDLog([NSString stringWithFormat:@"csstore: %@ bytes=%lu", name, (unsigned long)data.length]);
-            if (data.length > largestSize) largestSize = data.length;
             NSSet *ids = _extractBundleIDsFromBinary(data);
+            NSLog(@"[FD-CS] extracted %lu candidates from %@",
+                  (unsigned long)ids.count, name);
             [allCandidates unionSet:ids];
         }
     }
 
-    FDLog([NSString stringWithFormat:@"csstore: stores=%d candidates=%lu",
-           storesFound, (unsigned long)allCandidates.count]);
+    NSLog(@"[FD-CS] SUMMARY: dirs_accessible=%d stores=%d total_candidates=%lu",
+          dirsAccessible, storesFound, (unsigned long)allCandidates.count);
     return allCandidates;
 }
 
@@ -1397,4 +1433,169 @@ int FDContainerEngineInit(void) {
 
 const char *FDLastDiagnostic(void) {
     return sDiag;
+}
+
+NSString *FDRunFullDiagnostic(void) {
+    NSMutableString *report = [NSMutableString string];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    [report appendString:@"=== FileDavizin Diagnostic ===\n\n"];
+
+    // 1. MCM API status
+    MCMAPI *api = FDGetAPI();
+    [report appendFormat:@"[API] dylib handle: %s\n", api->handle ? "OK" : "NULL"];
+    [report appendFormat:@"[API] queryCreate: %s\n", api->queryCreate ? "OK" : "NULL"];
+    [report appendFormat:@"[API] querySetClass: %s\n", api->querySetClass ? "OK" : "NULL"];
+    [report appendFormat:@"[API] querySetIdentifiers: %s\n", api->querySetIdentifiers ? "OK" : "NULL"];
+    [report appendFormat:@"[API] querySetGroupIdentifiers: %s\n", api->querySetGroupIdentifiers ? "OK" : "NULL"];
+    [report appendFormat:@"[API] querySetFlags: %s\n", api->querySetFlags ? "OK" : "NULL"];
+    [report appendFormat:@"[API] querySetPart: %s\n", api->querySetPart ? "OK" : "NULL"];
+    [report appendFormat:@"[API] querySetPartDomain: %s\n", api->querySetPartDomain ? "OK" : "NULL"];
+    [report appendFormat:@"[API] queryGetSingle: %s\n", api->queryGetSingle ? "OK" : "NULL"];
+    [report appendFormat:@"[API] queryIterate: %s\n", api->queryIterate ? "OK" : "NULL"];
+    [report appendFormat:@"[API] objectGetPath: %s\n", api->objectGetPath ? "OK" : "NULL"];
+    [report appendFormat:@"[API] objectGetIdentifier: %s\n", api->objectGetIdentifier ? "OK" : "NULL"];
+    [report appendFormat:@"[API] objectCopy: %s\n", api->objectCopy ? "OK" : "NULL"];
+    [report appendFormat:@"[API] objectCopyToken: %s\n", api->objectCopyToken ? "OK" : "NULL"];
+    [report appendFormat:@"[API] objectActivate: %s\n", api->objectActivate ? "OK" : "NULL"];
+
+    // 2. sandbox_extension functions
+    void *consumeExt = dlsym(RTLD_DEFAULT, "sandbox_extension_consume");
+    void *releaseExt = dlsym(RTLD_DEFAULT, "sandbox_extension_release");
+    [report appendFormat:@"\n[SBX] sandbox_extension_consume: %s\n", consumeExt ? "OK" : "NULL"];
+    [report appendFormat:@"[SBX] sandbox_extension_release: %s\n", releaseExt ? "OK" : "NULL"];
+    [report appendFormat:@"[SBX] sandbox_access_is_active: %d\n", sandbox_access_is_active()];
+
+    // 3. App group containers
+    [report appendString:@"\n[GROUPS]\n"];
+    const char **rtGroups; int rtGroupCount;
+    _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
+    [report appendFormat:@"count: %d\n", rtGroupCount];
+    for (int g = 0; g < rtGroupCount; g++) {
+        NSString *gid = [NSString stringWithUTF8String:rtGroups[g]];
+        NSURL *url = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
+        [report appendFormat:@"  [%d] %s -> %@\n", g, rtGroups[g], url ? url.path : @"NULL"];
+        if (url) {
+            NSString *libPath = [url.path stringByAppendingPathComponent:@"Library"];
+            int libFd = open(libPath.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            [report appendFormat:@"       Library fd: %d (errno=%d)\n", libFd, libFd < 0 ? errno : 0];
+            if (libFd >= 0) close(libFd);
+        }
+    }
+
+    // 4. Key paths access test
+    [report appendString:@"\n[PATHS]\n"];
+    static const char *kTestPaths[] = {
+        "/private/var/mobile/Containers/Data/Application",
+        "/private/var/mobile/Containers/Data/System",
+        "/private/var/mobile/Containers/Shared/AppGroup",
+        "/private/var/mobile/Containers/Shared/SystemGroup",
+        "/private/var/mobile/Library/Caches",
+        "/private/var/mobile/Containers/Data/InternalDaemon",
+        "/private/var/db/lsd",
+        "/var/mobile/Containers/Data/Application",
+    };
+    for (int i = 0; i < (int)(sizeof(kTestPaths)/sizeof(kTestPaths[0])); i++) {
+        int fd = open(kTestPaths[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        DIR *dir = opendir(kTestPaths[i]);
+        int entries = 0;
+        if (dir) {
+            struct dirent *e;
+            while ((e = readdir(dir)) != NULL) {
+                if (e->d_name[0] != '.') entries++;
+                if (entries >= 5) break;
+            }
+            closedir(dir);
+        }
+        [report appendFormat:@"  %s -> fd=%d dir=%s entries>=%d\n",
+            kTestPaths[i], fd, dir ? "OK" : "NULL", entries];
+        if (fd >= 0) close(fd);
+    }
+
+    // 5. MCM class-2 enumeration test
+    [report appendString:@"\n[MCM-ENUM]\n"];
+    NSArray *enumResult = _enumerateIdentifiers(2, 10);
+    [report appendFormat:@"class-2 identifiers: %lu\n", (unsigned long)enumResult.count];
+    for (NSString *ident in enumResult) {
+        [report appendFormat:@"  %@\n", ident];
+    }
+
+    // 6. MCM class-2 specific resolve test
+    [report appendString:@"\n[MCM-RESOLVE]\n"];
+    NSArray *testBIDs = @[@"com.apple.mobilesafari", @"com.apple.Preferences",
+                          @"com.apple.MobileSMS", @"com.apple.mobilenotes"];
+    for (NSString *bid in testBIDs) {
+        NSString *path = _mcmResolvePath(bid);
+        [report appendFormat:@"  %@ -> %@\n", bid, path ?: @"NULL"];
+    }
+
+    // 7. csstore discovery
+    [report appendString:@"\n[CSSTORE]\n"];
+    NSSet *csCandidates = _findAndParseCSStores();
+    [report appendFormat:@"total candidates: %lu\n", (unsigned long)csCandidates.count];
+    if (csCandidates.count > 0) {
+        int shown = 0;
+        for (NSString *bid in csCandidates) {
+            if (shown >= 10) break;
+            [report appendFormat:@"  sample[%d]: %@\n", shown, bid];
+            shown++;
+        }
+        // Test resolve on first 20 candidates
+        int resolved = 0;
+        int tested = 0;
+        for (NSString *bid in csCandidates) {
+            if (tested >= 20) break;
+            tested++;
+            NSString *path = _mcmResolvePath(bid);
+            if (path) {
+                resolved++;
+                if (resolved <= 3) {
+                    [report appendFormat:@"  resolved: %@ -> %@\n", bid, path];
+                }
+            }
+        }
+        [report appendFormat:@"  resolve test: %d/%d resolved\n", resolved, tested];
+    }
+
+    // 8. LaunchServices
+    [report appendString:@"\n[LAUNCHSERVICES]\n"];
+    NSArray *lsApps = _launchServicesEnumerate();
+    [report appendFormat:@"LS apps: %lu\n", (unsigned long)lsApps.count];
+
+    // 9. Directory scan test
+    [report appendString:@"\n[DIR-SCAN]\n"];
+    static const char *kScanDirs[] = {
+        "/private/var/mobile/Containers/Data/Application",
+        "/var/mobile/Containers/Data/Application",
+    };
+    for (int d = 0; d < 2; d++) {
+        DIR *dir = opendir(kScanDirs[d]);
+        [report appendFormat:@"  opendir(%s): %s\n", kScanDirs[d], dir ? "OK" : "FAIL"];
+        if (dir) {
+            int count = 0;
+            int withPlist = 0;
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL && count < 500) {
+                if (entry->d_name[0] == '.') continue;
+                if (strlen(entry->d_name) < 32) continue;
+                count++;
+                char metaPath[1200];
+                snprintf(metaPath, sizeof(metaPath),
+                         "%s/%s/.com.apple.mobile_container_manager.metadata.plist",
+                         kScanDirs[d], entry->d_name);
+                if (access(metaPath, R_OK) == 0) withPlist++;
+            }
+            closedir(dir);
+            [report appendFormat:@"  UUID dirs: %d  with plist: %d\n", count, withPlist];
+        } else {
+            [report appendFormat:@"  errno: %d (%s)\n", errno, strerror(errno)];
+        }
+    }
+
+    // 10. Engine last diagnostic
+    [report appendFormat:@"\n[DIAG] %s\n", sDiag];
+    [report appendString:@"\n=== END ===\n"];
+
+    NSLog(@"[FD-DIAG]\n%@", report);
+    return report;
 }

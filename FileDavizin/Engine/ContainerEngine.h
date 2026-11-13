@@ -28,4 +28,8 @@ BOOL FDCanWrite(const char *dirPath);
 /// Get the diagnostic string from the last operation.
 const char * _Nonnull FDLastDiagnostic(void);
 
+/// Run full diagnostic and return a detailed report string.
+/// This tests every subsystem and logs results via NSLog.
+NSString *FDRunFullDiagnostic(void);
+
 NS_ASSUME_NONNULL_END

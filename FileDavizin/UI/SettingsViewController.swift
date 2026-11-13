@@ -67,6 +67,9 @@ final class SettingsViewController: UIViewController {
         let engineRows: [Row] = [
             Row(title: "Estado", detail: status.displayText, action: nil),
             Row(title: "Diagnóstico", detail: String(cString: FDLastDiagnostic()), action: nil),
+            Row(title: "Ejecutar diagnóstico completo", detail: "Prueba todas las rutas y copia al clipboard", action: { [weak self] in
+                self?.runFullDiagnostic()
+            }),
         ]
 
         let pathRows: [Row] = [
@@ -102,6 +105,27 @@ final class SettingsViewController: UIViewController {
     private func browsePath(_ path: String, title: String) {
         let browser = FileBrowserViewController(path: path, title: title)
         navigationController?.pushViewController(browser, animated: true)
+    }
+
+    private func runFullDiagnostic() {
+        let alert = UIAlertController(title: "Ejecutando diagnóstico...", message: nil, preferredStyle: .alert)
+        present(alert, animated: true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let report = FDRunFullDiagnostic()
+            DispatchQueue.main.async { [weak self] in
+                alert.dismiss(animated: true) {
+                    UIPasteboard.general.string = report
+                    let done = UIAlertController(
+                        title: "Diagnóstico copiado",
+                        message: "El reporte fue copiado al clipboard. Pégalo para compartirlo.",
+                        preferredStyle: .alert
+                    )
+                    done.addAction(UIAlertAction(title: "OK", style: .default))
+                    self?.present(done, animated: true)
+                    self?.rebuildData()
+                }
+            }
+        }
     }
 }
 
