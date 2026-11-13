@@ -45,19 +45,28 @@ enum FileAccessBridge {
 
     static func listDirectory(at path: String) -> [FileNode] {
         let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(atPath: path) else {
-            let handle = grantAccess(path: path)
-            defer { if handle < 9000 && handle >= 0 { /* keep lease-based grants alive */ } }
-            guard let retryEntries = try? fm.contentsOfDirectory(atPath: path) else {
-                return []
-            }
-            return retryEntries.compactMap { name in
+        if let entries = try? fm.contentsOfDirectory(atPath: path) {
+            return entries.compactMap { name in
                 fileNode(name: name, parentPath: path)
             }.sorted()
         }
-        return entries.compactMap { name in
-            fileNode(name: name, parentPath: path)
-        }.sorted()
+        let _ = grantAccess(path: path)
+        if let entries = try? fm.contentsOfDirectory(atPath: path) {
+            return entries.compactMap { name in
+                fileNode(name: name, parentPath: path)
+            }.sorted()
+        }
+        let parent = (path as NSString).deletingLastPathComponent
+        if parent.count > 1 {
+            let _ = grantAccess(path: parent)
+            if let entries = try? fm.contentsOfDirectory(atPath: path) {
+                return entries.compactMap { name in
+                    fileNode(name: name, parentPath: path)
+                }.sorted()
+            }
+        }
+        NSLog("[FD] listDirectory FAILED: %@", path)
+        return []
     }
 
     static func readFile(at path: String) -> Data? {

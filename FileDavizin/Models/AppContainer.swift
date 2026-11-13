@@ -27,7 +27,11 @@ struct AppContainer: Hashable {
     var containerSize: String {
         let fm = FileManager.default
         guard fm.fileExists(atPath: path) else { return "N/A" }
-        guard let contents = try? fm.contentsOfDirectory(atPath: path) else { return "N/A" }
+        if let contents = try? fm.contentsOfDirectory(atPath: path) {
+            return "\(contents.count) items"
+        }
+        let _ = FDGrantAccess(path)
+        guard let contents = try? fm.contentsOfDirectory(atPath: path) else { return "---" }
         return "\(contents.count) items"
     }
 
