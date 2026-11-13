@@ -31,6 +31,9 @@ targets:
       - path: FileDavizin
         excludes:
           - "Resources/**"
+          - "Engine/ContainerEngine.m"
+      - path: FileDavizin/Engine/ContainerEngine.m
+        compilerFlags: "-fno-objc-arc"
     resources:
       - path: FileDavizin/Resources
     settings:
