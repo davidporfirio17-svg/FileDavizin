@@ -654,11 +654,78 @@ static NSArray<NSString *> *_enumerateIdentifiers(uint64_t cls, NSUInteger limit
 
 #pragma mark - FDEnumerateApps
 
+static NSArray<NSDictionary<NSString *, NSString *> *> *_scanAllContainers(NSUInteger limit) {
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *results = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+
+    static const char *kDataDirs[] = {
+        "/private/var/mobile/Containers/Data/Application",
+        "/var/mobile/Containers/Data/Application",
+    };
+
+    for (int d = 0; d < 2 && results.count < limit; d++) {
+        // Grant access first
+        int64_t h = _worseQuerySymlink(kDataDirs[d]);
+        if (h < 0) {
+            h = FDGrantAccess(kDataDirs[d]);
+        }
+
+        DIR *dir = opendir(kDataDirs[d]);
+        if (!dir) continue;
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL && results.count < limit) {
+            if (entry->d_name[0] == '.') continue;
+            if (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN) continue;
+            if (strlen(entry->d_name) < 32) continue;
+
+            char fullPath[1200];
+            snprintf(fullPath, sizeof(fullPath), "%s/%s", kDataDirs[d], entry->d_name);
+
+            char metaPath[1200];
+            snprintf(metaPath, sizeof(metaPath),
+                     "%s/.com.apple.mobile_container_manager.metadata.plist",
+                     fullPath);
+
+            // Grant access to container dir to read metadata
+            int64_t ch = FDGrantAccess(fullPath);
+
+            NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:
+                [NSString stringWithUTF8String:metaPath]];
+
+            NSString *identifier = plist[@"MCMMetadataIdentifier"];
+            if (!identifier.length) {
+                // Try alternative key
+                identifier = plist[@"MCMMetadataContentClass"];
+                if (!identifier.length) {
+                    // Use UUID directory name as fallback identifier
+                    identifier = [NSString stringWithUTF8String:entry->d_name];
+                }
+            }
+
+            if ([seen containsObject:identifier]) continue;
+            [seen addObject:identifier];
+
+            NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+            dict[@"identifier"] = identifier;
+            dict[@"path"] = [NSString stringWithUTF8String:fullPath];
+            [results addObject:dict];
+        }
+        closedir(dir);
+    }
+
+    FDLog([NSString stringWithFormat:@"Directory scan found %lu containers",
+           (unsigned long)results.count]);
+    return results;
+}
+
 NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limit) {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *results = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
 
+    // Pass 1: MCM class-2 enumeration
     NSArray<NSString *> *identifiers = _enumerateIdentifiers(2, limit);
-    FDLog([NSString stringWithFormat:@"Enumerated %lu app identifiers",
+    FDLog([NSString stringWithFormat:@"MCM enumerated %lu app identifiers",
            (unsigned long)identifiers.count]);
 
     for (NSString *ident in identifiers) {
@@ -669,10 +736,25 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
         entry[@"identifier"] = ident;
         if (path) entry[@"path"] = path;
         [results addObject:entry];
+        [seen addObject:ident];
 
         if (results.count >= limit) break;
     }
 
+    // Pass 2: Directory scan fallback (critical for iOS 27+)
+    if (results.count == 0 || results.count < 5) {
+        NSArray *scanned = _scanAllContainers(limit);
+        for (NSDictionary *dict in scanned) {
+            NSString *ident = dict[@"identifier"];
+            if ([seen containsObject:ident]) continue;
+            [seen addObject:ident];
+            [results addObject:dict];
+            if (results.count >= limit) break;
+        }
+    }
+
+    FDLog([NSString stringWithFormat:@"Total enumerated: %lu containers",
+           (unsigned long)results.count]);
     return results;
 }
 
