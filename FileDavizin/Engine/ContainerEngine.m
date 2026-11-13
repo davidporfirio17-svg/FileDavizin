@@ -790,6 +790,188 @@ static NSArray<NSString *> *_enumerateIdentifiers(uint64_t cls, NSUInteger limit
     return identifiers.array;
 }
 
+#pragma mark - LaunchServices csstore parsing
+
+static NSSet<NSString *> *_extractBundleIDsFromBinary(NSData *data) {
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSUInteger len = data.length;
+    NSMutableSet *candidates = [NSMutableSet set];
+
+    static const char *prefixes[] = {
+        "com.", "org.", "net.", "io.", "app.", "me.", "dev.",
+        "co.", "in.", "uk.", "de.", "fr.", "jp.", "kr.",
+        "ru.", "cn.", "br.", "au.", "ca.", "eu.", "tv.", "us."
+    };
+    static const int prefixCount = sizeof(prefixes) / sizeof(prefixes[0]);
+
+    NSUInteger i = 0;
+    while (i < len) {
+        BOOL isPrefix = NO;
+        for (int p = 0; p < prefixCount; p++) {
+            size_t plen = strlen(prefixes[p]);
+            if (i + plen < len && memcmp(bytes + i, prefixes[p], plen) == 0) {
+                isPrefix = YES;
+                break;
+            }
+        }
+        if (!isPrefix) { i++; continue; }
+
+        NSUInteger start = i;
+        NSUInteger dots = 0;
+        while (i < len && (
+            (bytes[i] >= 'a' && bytes[i] <= 'z') ||
+            (bytes[i] >= 'A' && bytes[i] <= 'Z') ||
+            (bytes[i] >= '0' && bytes[i] <= '9') ||
+            bytes[i] == '.' || bytes[i] == '-' || bytes[i] == '_'
+        )) {
+            if (bytes[i] == '.') dots++;
+            i++;
+        }
+        NSUInteger slen = i - start;
+        if (dots >= 2 && slen >= 5 && slen <= 256) {
+            NSString *s = [[[NSString alloc] initWithBytes:bytes + start
+                                                    length:slen
+                                                  encoding:NSUTF8StringEncoding] autorelease];
+            if (s && ![s hasSuffix:@"."] && [s rangeOfString:@".."].location == NSNotFound) {
+                [candidates addObject:s];
+            }
+        }
+    }
+    return candidates;
+}
+
+static NSSet<NSString *> *_findAndParseCSStores(void) {
+    NSMutableSet *allCandidates = [NSMutableSet set];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    static const char *kStoreDirs[] = {
+        "/private/var/mobile/Library/Caches",
+        "/var/mobile/Library/Caches",
+        "/private/var/db/lsd",
+        "/var/db/lsd",
+    };
+    int ndirs = sizeof(kStoreDirs) / sizeof(kStoreDirs[0]);
+
+    // Also try InternalDaemon containers (where lsd keeps its csstore)
+    NSMutableArray *searchDirs = [NSMutableArray array];
+    for (int d = 0; d < ndirs; d++)
+        [searchDirs addObject:[NSString stringWithUTF8String:kStoreDirs[d]]];
+
+    NSArray *daemonDirs = @[
+        @"/private/var/mobile/Containers/Data/InternalDaemon",
+        @"/var/mobile/Containers/Data/InternalDaemon",
+    ];
+    for (NSString *daemonBase in daemonDirs) {
+        NSArray *uuids = [fm contentsOfDirectoryAtPath:daemonBase error:nil];
+        for (NSString *uuid in uuids) {
+            if (uuid.length < 32 || [uuid hasPrefix:@"."]) continue;
+            NSString *cachePath = [[[daemonBase stringByAppendingPathComponent:uuid]
+                                    stringByAppendingPathComponent:@"Library"]
+                                   stringByAppendingPathComponent:@"Caches"];
+            [searchDirs addObject:cachePath];
+        }
+    }
+
+    int storesFound = 0;
+    NSUInteger largestSize = 0;
+
+    for (NSString *dir in searchDirs) {
+        NSArray *contents = [fm contentsOfDirectoryAtPath:dir error:nil];
+        if (!contents) continue;
+        for (NSString *name in contents) {
+            if (![name hasPrefix:@"com.apple.LaunchServices-"]) continue;
+            if (![name hasSuffix:@".csstore"]) continue;
+            NSString *storePath = [dir stringByAppendingPathComponent:name];
+            NSData *data = [NSData dataWithContentsOfFile:storePath];
+            if (!data || data.length < 100) continue;
+            storesFound++;
+            FDLog([NSString stringWithFormat:@"csstore: %@ bytes=%lu", name, (unsigned long)data.length]);
+            if (data.length > largestSize) largestSize = data.length;
+            NSSet *ids = _extractBundleIDsFromBinary(data);
+            [allCandidates unionSet:ids];
+        }
+    }
+
+    FDLog([NSString stringWithFormat:@"csstore: stores=%d candidates=%lu",
+           storesFound, (unsigned long)allCandidates.count]);
+    return allCandidates;
+}
+
+static NSArray<NSString *> *_launchServicesEnumerate(void) {
+    NSMutableArray *bundleIDs = [NSMutableArray array];
+
+    void *cs = dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
+    if (!cs) {
+        FDLog(@"ls: failed to load CoreServices");
+        return bundleIDs;
+    }
+    FDLog(@"ls: loaded CoreServices");
+
+    Class LSWorkspace = NSClassFromString(@"LSApplicationWorkspace");
+    if (!LSWorkspace) {
+        FDLog(@"ls: LSApplicationWorkspace not found");
+        return bundleIDs;
+    }
+
+    id workspace = [LSWorkspace performSelector:@selector(defaultWorkspace)];
+    if (!workspace) return bundleIDs;
+
+    SEL selectors[] = {
+        @selector(allApplications),
+        @selector(allInstalledApplications),
+    };
+    const char *selNames[] = { "allApplications", "allInstalledApplications" };
+
+    for (int s = 0; s < 2; s++) {
+        if (![workspace respondsToSelector:selectors[s]]) continue;
+        NSArray *apps = [workspace performSelector:selectors[s]];
+        FDLog([NSString stringWithFormat:@"ls: %s returned %lu", selNames[s], (unsigned long)apps.count]);
+        for (id proxy in apps) {
+            NSString *bid = nil;
+            if ([proxy respondsToSelector:@selector(applicationIdentifier)])
+                bid = [proxy performSelector:@selector(applicationIdentifier)];
+            else if ([proxy respondsToSelector:@selector(bundleIdentifier)])
+                bid = [proxy performSelector:@selector(bundleIdentifier)];
+            if (bid.length > 0) [bundleIDs addObject:bid];
+        }
+        if (bundleIDs.count > 0) break;
+    }
+
+    FDLog([NSString stringWithFormat:@"ls: total=%lu", (unsigned long)bundleIDs.count]);
+    return bundleIDs;
+}
+
+static NSString *_mcmResolvePath(NSString *bundleID) {
+    MCMAPI *api = FDGetAPI();
+    if (!api->queryCreate || !api->querySetIdentifiers || !api->queryGetSingle || !api->objectGetPath)
+        return nil;
+
+    static const uint64_t kFlags[] = { 0x900000000ULL, 0x8100000000ULL };
+    for (int f = 0; f < 2; f++) {
+        void *q = api->queryCreate();
+        if (!q) continue;
+        api->querySetClass(q, 2);
+        xpc_object_t xid = xpc_string_create(bundleID.UTF8String);
+        api->querySetIdentifiers(q, xid);
+        api->querySetFlags(q, kFlags[f]);
+        if (api->querySetPart) api->querySetPart(q, 0);
+        void *res = api->queryGetSingle(q);
+        NSString *path = nil;
+        if (res) {
+            const char *raw = api->objectGetPath(res);
+            if (raw) {
+                path = [NSString stringWithUTF8String:raw];
+                if (path && ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"]))
+                    path = [@"/private" stringByAppendingString:path];
+            }
+        }
+        xpc_release(xid);
+        api->queryFree(q);
+        if (path.length > 0 && path.isAbsolutePath) return path;
+    }
+    return nil;
+}
+
 #pragma mark - FDEnumerateApps
 
 static NSArray<NSDictionary<NSString *, NSString *> *> *_scanAllContainers(NSUInteger limit) {
@@ -914,7 +1096,50 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
         if (results.count >= limit) break;
     }
 
-    // Pass 2: Directory scan (always — critical for iOS 27+ where MCM returns empty)
+    // Pass 2: LaunchServices API + csstore parsing → MCM-C2 batch resolve
+    // This is how 3105 discovers apps on iOS 27+
+    {
+        NSMutableSet *bundleCandidates = [NSMutableSet set];
+
+        // 2a: Try LaunchServices workspace API
+        NSArray *lsApps = _launchServicesEnumerate();
+        for (NSString *bid in lsApps) {
+            if (![seen containsObject:bid])
+                [bundleCandidates addObject:bid];
+        }
+
+        // 2b: Parse LaunchServices csstore files
+        NSSet *csCandidates = _findAndParseCSStores();
+        for (NSString *bid in csCandidates) {
+            if (![seen containsObject:bid])
+                [bundleCandidates addObject:bid];
+        }
+
+        FDLog([NSString stringWithFormat:@"LS+csstore: %lu new candidates to resolve",
+               (unsigned long)bundleCandidates.count]);
+
+        // 2c: Batch-resolve each candidate via MCM class-2
+        int resolved = 0;
+        for (NSString *bid in bundleCandidates) {
+            if (results.count >= limit) break;
+            @autoreleasepool {
+                NSString *path = _mcmResolvePath(bid);
+                if (path) {
+                    resolved++;
+                    [seen addObject:bid];
+                    NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+                    entry[@"identifier"] = bid;
+                    entry[@"path"] = path;
+                    [results addObject:entry];
+                }
+            }
+        }
+
+        FDLog([NSString stringWithFormat:@"MHA-C2 resolved %d/%lu bundle candidates",
+               resolved, (unsigned long)bundleCandidates.count]);
+    }
+
+    // Pass 3: Directory scan (fallback)
     {
         NSArray *scanned = _scanAllContainers(limit);
         for (NSDictionary *dict in scanned) {
@@ -1037,6 +1262,8 @@ int FDContainerEngineInit(void) {
         "/private/var/mobile/Containers/Data/System",
         "/private/var/mobile/Containers/Shared/AppGroup",
         "/private/var/mobile/Containers/Shared/SystemGroup",
+        "/private/var/mobile/Library/Caches",
+        "/private/var/mobile/Containers/Data/InternalDaemon",
     };
     int n = sizeof(kEscapePaths) / sizeof(kEscapePaths[0]);
     int granted = 0;
