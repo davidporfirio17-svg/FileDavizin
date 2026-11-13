@@ -1,0 +1,43 @@
+name: FileDavizin
+options:
+  bundleIdPrefix: com.apple.mobile
+  deploymentTarget:
+    iOS: "16.0"
+  defaultConfig: Release
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    DEVELOPMENT_TEAM: ""
+    ONLY_ACTIVE_ARCH: "NO"
+    ALWAYS_SEARCH_USER_PATHS: "NO"
+    SWIFT_OBJC_BRIDGING_HEADER: "FileDavizin/FileDavizin-Bridging-Header.h"
+    HEADER_SEARCH_PATHS:
+      - "$(SRCROOT)/FileDavizin"
+      - "$(SRCROOT)/FileDavizin/kexploit"
+    OTHER_LDFLAGS:
+      - "$(inherited)"
+      - "-ld_classic"
+
+targets:
+  FileDavizin:
+    type: application
+    platform: iOS
+    sources:
+      - path: FileDavizin
+        excludes:
+          - "Resources/**"
+    resources:
+      - path: FileDavizin/Resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.apple.mobile.MobileHouseArrest
+        INFOPLIST_FILE: FileDavizin/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FileDavizin/FileDavizin.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+    scheme:
+      testTargets: []

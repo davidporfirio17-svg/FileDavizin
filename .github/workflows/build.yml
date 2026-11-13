@@ -1,0 +1,112 @@
+name: Build FileDavizin iOS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install XcodeGen
+      run: brew install xcodegen
+
+    - name: Generate Xcode project
+      run: |
+        xcodegen generate
+        echo "=== Generated project ==="
+        ls -la FileDavizin.xcodeproj/
+
+    - name: Build
+      run: |
+        set +e
+        xcodebuild \
+          -project FileDavizin.xcodeproj \
+          -scheme FileDavizin \
+          -configuration Release \
+          -sdk iphoneos \
+          -arch arm64 \
+          IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO \
+          DEVELOPMENT_TEAM="" \
+          ONLY_ACTIVE_ARCH=NO \
+          ALWAYS_SEARCH_USER_PATHS=NO \
+          BUILD_DIR=/tmp/fd_build \
+          OTHER_LDFLAGS='$(inherited) -ld_classic' \
+          build > /tmp/build.log 2>&1
+        status=$?
+        set -e
+
+        echo "=== Build completed. Checking for .app ==="
+        find /tmp/fd_build -name "*.app" -type d 2>/dev/null || echo "No .app found"
+
+        echo "=== Checking for errors in log ==="
+        grep -i "error:" /tmp/build.log | head -20 || echo "No errors found"
+        echo "=== Linker diagnostics ==="
+        grep -n -A120 -B20 -E "Undefined symbols|duplicate symbol|ld:|clang: error" /tmp/build.log | tail -180 || true
+
+        if [ "$status" -ne 0 ]; then
+          echo "=== Build FAILED (status $status) ==="
+          grep -iE "error:|fatal error|undefined symbol" /tmp/build.log | grep -v "^ld: warning" | sort -u | head -30 | while IFS= read -r line; do
+            escaped=$(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/\n/%0A/g')
+            echo "::error::${escaped}"
+          done
+          exit "$status"
+        fi
+
+    - name: Inject build number into Info.plist
+      run: |
+        APP=$(find /tmp/fd_build -name "*.app" -not -path "*/simulator/*" -type d | head -1)
+        if [ -z "$APP" ]; then
+          echo "ERROR: No .app found"
+          exit 1
+        fi
+        BUILD_NUM="${GITHUB_RUN_NUMBER}"
+        echo "Injecting FDBuildNumber=${BUILD_NUM} into $APP/Info.plist"
+        /usr/libexec/PlistBuddy -c "Delete :FDBuildNumber" "$APP/Info.plist" 2>/dev/null || true
+        /usr/libexec/PlistBuddy -c "Add :FDBuildNumber string ${BUILD_NUM}" "$APP/Info.plist"
+        /usr/libexec/PlistBuddy -c "Print :FDBuildNumber" "$APP/Info.plist"
+
+    - name: Embed entitlements with ldid
+      run: |
+        brew install ldid
+        APP=$(find /tmp/fd_build -name "*.app" -not -path "*/simulator/*" -type d | head -1)
+        if [ -z "$APP" ]; then
+          echo "ERROR: No .app found"
+          exit 1
+        fi
+        BINARY="$APP/$(defaults read "$APP/Info.plist" CFBundleExecutable)"
+        echo "Embedding entitlements into: $BINARY"
+        ldid -SFileDavizin/FileDavizin.entitlements "$BINARY"
+        echo "Entitlements embedded successfully"
+
+    - name: Create IPA
+      run: |
+        APP=$(find /tmp/fd_build -name "*.app" -not -path "*/simulator/*" -type d | head -1)
+        if [ -z "$APP" ]; then
+          echo "ERROR: No .app found"
+          exit 1
+        fi
+
+        echo "Found app: $APP"
+        du -sh "$APP"
+
+        mkdir -p /tmp/Payload
+        cp -r "$APP" /tmp/Payload/FileDavizin.app
+        cd /tmp && zip -r "FileDavizin_1.0_build${GITHUB_RUN_NUMBER}.ipa" Payload/
+
+        ls -lh "/tmp/FileDavizin_1.0_build${GITHUB_RUN_NUMBER}.ipa"
+        unzip -l "/tmp/FileDavizin_1.0_build${GITHUB_RUN_NUMBER}.ipa" | head -20
+
+    - name: Upload IPA
+      uses: actions/upload-artifact@v4
+      with:
+        name: FileDavizin_1.0_build${{ github.run_number }}
+        path: /tmp/FileDavizin_1.0_build${{ github.run_number }}.ipa
+        retention-days: 30
