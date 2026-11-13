@@ -840,52 +840,169 @@ static NSSet<NSString *> *_extractBundleIDsFromBinary(NSData *data) {
     return candidates;
 }
 
+static NSString *_mcmQuerySystemContainerPath(uint64_t cls, NSString *identifier, BOOL group) {
+    MCMAPI *api = FDGetAPI();
+    if (!api->queryCreate || !api->queryGetSingle || !api->objectGetPath) return nil;
+
+    static const uint64_t kFlags[] = { 0x900000000ULL, 0x8100000000ULL, 0x100000000ULL };
+    for (int f = 0; f < 3; f++) {
+        void *q = api->queryCreate();
+        if (!q) continue;
+
+        api->querySetClass(q, cls);
+        xpc_object_t xid = xpc_string_create(identifier.UTF8String);
+        if (group && api->querySetGroupIdentifiers)
+            api->querySetGroupIdentifiers(q, xid);
+        else
+            api->querySetIdentifiers(q, xid);
+        api->querySetFlags(q, kFlags[f]);
+        if (api->querySetPart) api->querySetPart(q, 0);
+
+        void *res = api->queryGetSingle(q);
+        NSString *path = nil;
+        if (res) {
+            const char *raw = api->objectGetPath(res);
+            if (raw) {
+                path = [NSString stringWithUTF8String:raw];
+                if (path && ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"]))
+                    path = [@"/private" stringByAppendingString:path];
+            }
+            if (api->objectCopy && api->objectActivate) {
+                void *act = api->objectCopy(res);
+                if (act) {
+                    char *token = api->objectCopyToken ? api->objectCopyToken(act) : NULL;
+                    if (token && token[0] != '\0')
+                        api->objectActivate(act, false);
+                    free(token);
+                    if (api->objectFree) api->objectFree(act);
+                }
+            }
+        }
+        xpc_release(xid);
+        api->queryFree(q);
+        if (path.length > 0 && path.isAbsolutePath) {
+            NSLog(@"[FD-CS] MCM class-%llu %@ -> %@ (flags=0x%llx)",
+                  cls, identifier, path, kFlags[f]);
+            return path;
+        }
+    }
+    return nil;
+}
+
 static NSSet<NSString *> *_findAndParseCSStores(void) {
     NSMutableSet *allCandidates = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *searchDirs = [NSMutableArray array];
 
-    static const char *kStoreDirs[] = {
+    // Step 1: Discover com.apple.lsd container via MCM (class 10, 12, 2)
+    // This is the KEY mechanism — lsd keeps its csstore in its own container
+    static const struct { uint64_t cls; const char *ident; bool grp; } kLSDQueries[] = {
+        { 10, "com.apple.lsd",   false },
+        { 12, "com.apple.lsd",   false },
+        { 2,  "com.apple.lsd",   false },
+        { 10, "com.apple.mobileslideshow", false },
+        { 13, "systemgroup.com.apple.lsd.mapdb", true },
+    };
+    int nq = sizeof(kLSDQueries) / sizeof(kLSDQueries[0]);
+
+    for (int qi = 0; qi < nq; qi++) {
+        NSString *ident = [NSString stringWithUTF8String:kLSDQueries[qi].ident];
+        NSString *lsdPath = _mcmQuerySystemContainerPath(
+            kLSDQueries[qi].cls, ident, kLSDQueries[qi].grp);
+        if (lsdPath) {
+            int64_t h = _worseQuerySymlink(lsdPath.fileSystemRepresentation);
+            NSLog(@"[FD-CS] lsd container grant WQ-SYM h=%lld path=%@",
+                  (long long)h, lsdPath);
+            if (h < 0) {
+                h = _worseQueryGrant(lsdPath.fileSystemRepresentation, "fd-lsd");
+                NSLog(@"[FD-CS] lsd container grant WQ-PD h=%lld", (long long)h);
+            }
+            NSString *cachePath = [[lsdPath stringByAppendingPathComponent:@"Library"]
+                                   stringByAppendingPathComponent:@"Caches"];
+            [searchDirs addObject:cachePath];
+            [searchDirs addObject:lsdPath];
+            [searchDirs addObject:[lsdPath stringByAppendingPathComponent:@"Library"]];
+        }
+    }
+
+    // Step 2: Also enumerate all class-10 containers (InternalDaemon)
+    // to find any container that might hold csstore files
+    MCMAPI *api = FDGetAPI();
+    if (api->queryCreate && api->queryIterate && api->objectGetPath && api->objectGetIdentifier) {
+        static const uint64_t kEnumClasses[] = { 10, 12 };
+        for (int ci = 0; ci < 2; ci++) {
+            void *q = api->queryCreate();
+            if (!q) continue;
+            api->querySetClass(q, kEnumClasses[ci]);
+            api->querySetFlags(q, 0x100000000ULL);
+            if (api->querySetPart) api->querySetPart(q, 0);
+
+            __block int enumCount = 0;
+            api->queryIterate(q, ^bool(void *obj) {
+                if (!obj) return enumCount < 50;
+                const char *rawPath = api->objectGetPath(obj);
+                const char *rawIdent = api->objectGetIdentifier(obj);
+                if (rawPath) {
+                    NSString *p = [NSString stringWithUTF8String:rawPath];
+                    if ([p isEqualToString:@"/var"] || [p hasPrefix:@"/var/"])
+                        p = [@"/private" stringByAppendingString:p];
+                    NSString *cacheSub = [[p stringByAppendingPathComponent:@"Library"]
+                                          stringByAppendingPathComponent:@"Caches"];
+                    [searchDirs addObject:cacheSub];
+                    [searchDirs addObject:p];
+
+                    int64_t h = _worseQuerySymlink(p.fileSystemRepresentation);
+                    if (h < 0)
+                        h = _worseQueryGrant(p.fileSystemRepresentation, "fd-enum-daemon");
+                    NSLog(@"[FD-CS] class-%llu enum[%d] id=%s path=%@ grant=%lld",
+                          kEnumClasses[ci], enumCount,
+                          rawIdent ?: "?", p, (long long)h);
+                }
+                enumCount++;
+                return enumCount < 50;
+            });
+            api->queryFree(q);
+            NSLog(@"[FD-CS] class-%llu enumeration -> %d containers", kEnumClasses[ci], enumCount);
+        }
+    }
+
+    // Step 3: Static fallback directories
+    static const char *kStaticDirs[] = {
         "/private/var/mobile/Library/Caches",
         "/var/mobile/Library/Caches",
-        "/private/var/db/lsd",
-        "/var/db/lsd",
     };
-    int ndirs = sizeof(kStoreDirs) / sizeof(kStoreDirs[0]);
+    for (int d = 0; d < 2; d++)
+        [searchDirs addObject:[NSString stringWithUTF8String:kStaticDirs[d]]];
 
-    NSMutableArray *searchDirs = [NSMutableArray array];
-    for (int d = 0; d < ndirs; d++)
-        [searchDirs addObject:[NSString stringWithUTF8String:kStoreDirs[d]]];
-
-    // Try InternalDaemon containers (where lsd keeps its csstore)
-    NSArray *daemonDirs = @[
+    // Step 4: Scan InternalDaemon base dir for UUID subdirs
+    NSArray *daemonBases = @[
         @"/private/var/mobile/Containers/Data/InternalDaemon",
         @"/var/mobile/Containers/Data/InternalDaemon",
+        @"/private/var/containers/Data/InternalDaemon",
     ];
-    for (NSString *daemonBase in daemonDirs) {
-        NSError *err = nil;
-        NSArray *uuids = [fm contentsOfDirectoryAtPath:daemonBase error:&err];
-        NSLog(@"[FD-CS] InternalDaemon scan %@ -> %lu entries (err=%@)",
-              daemonBase, (unsigned long)uuids.count, err);
+    for (NSString *daemonBase in daemonBases) {
+        NSArray *uuids = [fm contentsOfDirectoryAtPath:daemonBase error:nil];
+        NSLog(@"[FD-CS] InternalDaemon dir %@ -> %lu entries",
+              daemonBase, (unsigned long)uuids.count);
         for (NSString *uuid in uuids) {
             if (uuid.length < 32 || [uuid hasPrefix:@"."]) continue;
             NSString *containerPath = [daemonBase stringByAppendingPathComponent:uuid];
+            int64_t h = _worseQuerySymlink(containerPath.fileSystemRepresentation);
+            if (h < 0)
+                h = _worseQueryGrant(containerPath.fileSystemRepresentation, "fd-daemon");
             NSString *cachePath = [[containerPath
                                     stringByAppendingPathComponent:@"Library"]
                                    stringByAppendingPathComponent:@"Caches"];
             [searchDirs addObject:cachePath];
-            // Also check root of container and Library directly
             [searchDirs addObject:containerPath];
-            [searchDirs addObject:[containerPath stringByAppendingPathComponent:@"Library"]];
         }
     }
 
-    // Also try system container subdirectories
-    NSArray *extraPaths = @[
-        @"/private/var/containers/Data/InternalDaemon",
-        @"/var/containers/Data/InternalDaemon",
+    // Step 5: System containers
+    NSArray *sysBases = @[
         @"/private/var/mobile/Containers/Data/System",
     ];
-    for (NSString *base in extraPaths) {
+    for (NSString *base in sysBases) {
         NSArray *entries = [fm contentsOfDirectoryAtPath:base error:nil];
         for (NSString *uuid in entries) {
             if (uuid.length < 32 || [uuid hasPrefix:@"."]) continue;
@@ -896,25 +1013,20 @@ static NSSet<NSString *> *_findAndParseCSStores(void) {
         }
     }
 
-    NSLog(@"[FD-CS] total search dirs: %lu", (unsigned long)searchDirs.count);
+    // Remove duplicates
+    NSOrderedSet *uniqueDirs = [NSOrderedSet orderedSetWithArray:searchDirs];
+    NSLog(@"[FD-CS] total unique search dirs: %lu", (unsigned long)uniqueDirs.count);
 
     int storesFound = 0;
     int dirsAccessible = 0;
 
-    for (NSString *dir in searchDirs) {
+    for (NSString *dir in uniqueDirs) {
         NSError *dirErr = nil;
         NSArray *contents = [fm contentsOfDirectoryAtPath:dir error:&dirErr];
-        if (!contents) {
-            // Only log the first few to avoid spam
-            if (dirsAccessible == 0 && storesFound == 0) {
-                NSLog(@"[FD-CS] dir FAIL: %@ errno=%d", dir, (int)dirErr.code);
-            }
-            continue;
-        }
+        if (!contents) continue;
         dirsAccessible++;
         for (NSString *name in contents) {
             if (![name hasPrefix:@"com.apple.LaunchServices-"]) continue;
-            if (![name hasSuffix:@".csstore"]) continue;
             NSString *storePath = [dir stringByAppendingPathComponent:name];
             NSData *data = [NSData dataWithContentsOfFile:storePath];
             NSLog(@"[FD-CS] FOUND store: %@ bytes=%lu at %@",
@@ -1318,6 +1430,50 @@ int FDContainerEngineInit(void) {
         }
     }
 
+    // Pass 1.5: Discover lsd InternalDaemon container and grant access
+    // This is CRITICAL for iOS 27+ — lsd keeps csstore files in its own container
+    {
+        static const struct { uint64_t cls; const char *ident; bool grp; } kSysContainers[] = {
+            { 10, "com.apple.lsd",       false },
+            { 10, "com.apple.swcd",      false },
+            { 12, "com.apple.geod",      false },
+            { 12, "com.apple.eligibilityd", false },
+            { 13, "systemgroup.com.apple.mobilegestaltcache", true },
+            { 13, "systemgroup.com.apple.installcoordinationd", true },
+            { 15, "com.apple.appmanagedfeaturesd", false },
+        };
+        int nsys = sizeof(kSysContainers) / sizeof(kSysContainers[0]);
+        for (int si = 0; si < nsys; si++) {
+            NSString *ident = [NSString stringWithUTF8String:kSysContainers[si].ident];
+            NSString *path = _mcmQuerySystemContainerPath(
+                kSysContainers[si].cls, ident, kSysContainers[si].grp);
+            if (!path) continue;
+            int fd = open(path.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (fd >= 0) {
+                close(fd);
+                FDLog([NSString stringWithFormat:@"init sys-container %@ already accessible", ident]);
+                continue;
+            }
+            int64_t h = _worseQuerySymlink(path.fileSystemRepresentation);
+            if (h >= 0) {
+                granted++;
+                _diagAppend("init-sys-sym: %s OK | ", ident.UTF8String);
+                FDLog([NSString stringWithFormat:@"init sys-container WQ-SYM OK: %@ -> %@ h=%lld",
+                       ident, path, (long long)h]);
+            } else {
+                h = _worseQueryGrant(path.fileSystemRepresentation, "fd-sys");
+                if (h >= 0) {
+                    granted++;
+                    _diagAppend("init-sys-pd: %s OK | ", ident.UTF8String);
+                    FDLog([NSString stringWithFormat:@"init sys-container WQ-PD OK: %@ -> %@ h=%lld",
+                           ident, path, (long long)h]);
+                } else {
+                    FDLog([NSString stringWithFormat:@"init sys-container FAIL: %@ -> %@", ident, path]);
+                }
+            }
+        }
+    }
+
     // Pass 2: WQ partDomain for paths not yet accessible
     for (int i = 0; i < n; i++) {
         int fd = open(kEscapePaths[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1527,6 +1683,43 @@ NSString *FDRunFullDiagnostic(void) {
     for (NSString *bid in testBIDs) {
         NSString *path = _mcmResolvePath(bid);
         [report appendFormat:@"  %@ -> %@\n", bid, path ?: @"NULL"];
+    }
+
+    // 6.5. System container discovery (lsd, swcd, etc.)
+    [report appendString:@"\n[SYS-CONTAINERS]\n"];
+    {
+        static const struct { uint64_t cls; const char *ident; bool grp; } kSysDiag[] = {
+            { 10, "com.apple.lsd",       false },
+            { 10, "com.apple.swcd",      false },
+            { 12, "com.apple.geod",      false },
+            { 12, "com.apple.eligibilityd", false },
+            { 13, "systemgroup.com.apple.mobilegestaltcache", true },
+            { 15, "com.apple.appmanagedfeaturesd", false },
+        };
+        for (int si = 0; si < 6; si++) {
+            NSString *ident = [NSString stringWithUTF8String:kSysDiag[si].ident];
+            NSString *path = _mcmQuerySystemContainerPath(
+                kSysDiag[si].cls, ident, kSysDiag[si].grp);
+            int accessible = -1;
+            int entries = 0;
+            if (path) {
+                int fd = open(path.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                accessible = (fd >= 0) ? 1 : 0;
+                if (fd >= 0) close(fd);
+                NSString *cachePath = [[path stringByAppendingPathComponent:@"Library"]
+                                       stringByAppendingPathComponent:@"Caches"];
+                DIR *dir = opendir(cachePath.fileSystemRepresentation);
+                if (dir) {
+                    struct dirent *e;
+                    while ((e = readdir(dir)) != NULL) {
+                        if (e->d_name[0] != '.') entries++;
+                    }
+                    closedir(dir);
+                }
+            }
+            [report appendFormat:@"  C%llu %@ -> %@ acc=%d cache_entries=%d\n",
+                kSysDiag[si].cls, ident, path ?: @"NULL", accessible, entries];
+        }
     }
 
     // 7. csstore discovery
