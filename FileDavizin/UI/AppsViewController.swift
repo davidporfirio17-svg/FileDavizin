@@ -8,6 +8,7 @@ final class AppsViewController: UIViewController {
     private let statusLabel = UILabel()
     private let spinner = UIActivityIndicatorView(style: .medium)
     private var isScanning = false
+    private var statusObserver: NSObjectProtocol?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -16,7 +17,28 @@ final class AppsViewController: UIViewController {
         setupSearchBar()
         setupCollectionView()
         setupStatusBar()
-        scan()
+
+        statusObserver = NotificationCenter.default.addObserver(
+            forName: SandboxManager.statusDidChange,
+            object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let status = notification.object as? SandboxStatus,
+                  status.isReady else { return }
+            self?.scan()
+        }
+
+        if SandboxManager.shared.status.isReady {
+            scan()
+        } else {
+            statusLabel.text = "Esperando motor de acceso..."
+            spinner.startAnimating()
+        }
+    }
+
+    deinit {
+        if let observer = statusObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
     }
 
     private func setupSearchBar() {
@@ -67,6 +89,7 @@ final class AppsViewController: UIViewController {
         statusLabel.font = FDTheme.captionFont()
         statusLabel.textColor = FDTheme.tertiaryText
         statusLabel.textAlignment = .center
+        statusLabel.numberOfLines = 0
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(statusLabel)
 
@@ -77,6 +100,8 @@ final class AppsViewController: UIViewController {
         NSLayoutConstraint.activate([
             statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             statusLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
+            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
             spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             spinner.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -12)
         ])
@@ -102,11 +127,20 @@ final class AppsViewController: UIViewController {
                 self.spinner.stopAnimating()
                 self.collectionView.refreshControl?.endRefreshing()
                 if self.allContainers.isEmpty {
-                    self.statusLabel.text = "No se encontraron contenedores"
+                    self.statusLabel.text = "No se encontraron contenedores.\nAsegúrate de tener apps instaladas\ny desliza hacia abajo para reintentar."
                 } else {
                     self.statusLabel.text = nil
                 }
+                self.updateTitle()
             }
+        }
+    }
+
+    private func updateTitle() {
+        if allContainers.isEmpty {
+            title = "Apps"
+        } else {
+            title = "Apps (\(filteredContainers.count))"
         }
     }
 
@@ -116,10 +150,12 @@ final class AppsViewController: UIViewController {
             filteredContainers = allContainers
         } else {
             filteredContainers = allContainers.filter {
-                $0.identifier.lowercased().contains(query)
+                $0.identifier.lowercased().contains(query) ||
+                $0.displayName.lowercased().contains(query)
             }
         }
         collectionView.reloadData()
+        updateTitle()
     }
 }
 

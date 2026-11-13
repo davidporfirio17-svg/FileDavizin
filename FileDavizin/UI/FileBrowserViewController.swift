@@ -4,6 +4,8 @@ final class FileBrowserViewController: UIViewController {
     private let rootPath: String
     private var nodes: [FileNode] = []
     private let tableView = UITableView(frame: .zero, style: .plain)
+    private let emptyLabel = UILabel()
+    private let spinner = UIActivityIndicatorView(style: .medium)
 
     init(path: String, title: String) {
         self.rootPath = path
@@ -17,7 +19,9 @@ final class FileBrowserViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = FDTheme.background
         setupTableView()
+        setupEmptyState()
         setupToolbar()
+        setupNavButtons()
         loadContents()
     }
 
@@ -43,6 +47,30 @@ final class FileBrowserViewController: UIViewController {
         ])
     }
 
+    private func setupEmptyState() {
+        emptyLabel.text = "Cargando..."
+        emptyLabel.font = FDTheme.captionFont()
+        emptyLabel.textColor = FDTheme.tertiaryText
+        emptyLabel.textAlignment = .center
+        emptyLabel.numberOfLines = 0
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(emptyLabel)
+
+        spinner.color = FDTheme.accent
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(spinner)
+
+        NSLayoutConstraint.activate([
+            emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            emptyLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
+            emptyLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
+            spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            spinner.bottomAnchor.constraint(equalTo: emptyLabel.topAnchor, constant: -12),
+        ])
+        spinner.startAnimating()
+    }
+
     private func setupToolbar() {
         let appearance = UIToolbarAppearance()
         appearance.configureWithOpaqueBackground()
@@ -58,7 +86,29 @@ final class FileBrowserViewController: UIViewController {
         pathLabel.setTitleTextAttributes([.font: FDTheme.monoFont(11)], for: .disabled)
         pathLabel.isEnabled = false
 
-        toolbarItems = [pathLabel]
+        let countLabel = UIBarButtonItem(
+            title: "", style: .plain, target: nil, action: nil)
+        countLabel.tintColor = FDTheme.secondaryText
+        countLabel.setTitleTextAttributes([.font: FDTheme.captionFont()], for: .normal)
+        countLabel.isEnabled = false
+        countLabel.tag = 999
+
+        toolbarItems = [
+            pathLabel,
+            UIBarButtonItem.flexibleSpace(),
+            countLabel,
+        ]
+    }
+
+    private func setupNavButtons() {
+        let refreshBtn = UIBarButtonItem(
+            image: UIImage(systemName: "arrow.clockwise"),
+            style: .plain, target: self, action: #selector(refreshTapped))
+        navigationItem.rightBarButtonItem = refreshBtn
+    }
+
+    @objc private func refreshTapped() {
+        loadContents()
     }
 
     private func shortenedPath(_ path: String) -> String {
@@ -70,32 +120,53 @@ final class FileBrowserViewController: UIViewController {
     }
 
     private func loadContents() {
+        emptyLabel.text = "Cargando..."
+        spinner.startAnimating()
+        emptyLabel.isHidden = false
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+
+            // Grant access before listing
+            let _ = FileAccessBridge.grantAccess(path: self.rootPath)
+
             let items = FileAccessBridge.listDirectory(at: self.rootPath)
-            let sorted = items.sorted { a, b in
-                if a.isDirectory != b.isDirectory { return a.isDirectory }
-                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-            }
+            let sorted = items.sorted()
+
             DispatchQueue.main.async {
                 self.nodes = sorted
                 self.tableView.reloadData()
+                self.spinner.stopAnimating()
+
+                if sorted.isEmpty {
+                    self.emptyLabel.text = "Carpeta vacía o sin acceso"
+                    self.emptyLabel.isHidden = false
+                } else {
+                    self.emptyLabel.isHidden = true
+                }
+
+                self.updateCountLabel()
             }
         }
     }
 
+    private func updateCountLabel() {
+        let dirs = nodes.filter { $0.isDirectory }.count
+        let files = nodes.count - dirs
+        if let countItem = toolbarItems?.first(where: { $0.tag == 999 }) {
+            countItem.title = "\(dirs) carpetas, \(files) archivos"
+        }
+    }
+
     private func shareFile(at path: String) {
-        let url = URL(fileURLWithPath: path)
-        let ac = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-        ac.popoverPresentationController?.sourceView = view
-        present(ac, animated: true)
+        FileAccessBridge.shareFile(at: path, from: self)
     }
 
     private func deleteFile(at indexPath: IndexPath) {
         let node = nodes[indexPath.row]
         let alert = UIAlertController(
             title: "Eliminar",
-            message: "Eliminar \"\(node.name)\"?",
+            message: "¿Eliminar \"\(node.name)\"?",
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Cancelar", style: .cancel))
         alert.addAction(UIAlertAction(title: "Eliminar", style: .destructive) { [weak self] _ in
@@ -103,6 +174,11 @@ final class FileBrowserViewController: UIViewController {
             if FileAccessBridge.deleteItem(at: node.path) {
                 self.nodes.remove(at: indexPath.row)
                 self.tableView.deleteRows(at: [indexPath], with: .automatic)
+                self.updateCountLabel()
+            } else {
+                let err = UIAlertController(title: "Error", message: "No se pudo eliminar el archivo.", preferredStyle: .alert)
+                err.addAction(UIAlertAction(title: "OK", style: .default))
+                self.present(err, animated: true)
             }
         })
         present(alert, animated: true)
@@ -116,7 +192,39 @@ final class FileBrowserViewController: UIViewController {
             let alert = UIAlertController(title: "Copiado", message: "\(name) guardado en Documents.", preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default))
             present(alert, animated: true)
+        } else {
+            let alert = UIAlertController(title: "Error", message: "No se pudo copiar el archivo.", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
         }
+    }
+
+    private func showFileInfo(for node: FileNode) {
+        var msg = "Ruta: \(node.path)\n"
+        msg += "Tamaño: \(node.displaySize)\n"
+        if let date = node.displayDate {
+            msg += "Modificado: \(date)\n"
+        }
+        msg += "Tipo: \(node.isDirectory ? "Carpeta" : node.fileExtension.uppercased())"
+
+        let alert = UIAlertController(title: node.name, message: msg, preferredStyle: .actionSheet)
+        alert.addAction(UIAlertAction(title: "Copiar ruta", style: .default) { _ in
+            UIPasteboard.general.string = node.path
+        })
+        if !node.isDirectory {
+            alert.addAction(UIAlertAction(title: "Compartir", style: .default) { [weak self] _ in
+                self?.shareFile(at: node.path)
+            })
+            alert.addAction(UIAlertAction(title: "Copiar a Documents", style: .default) { [weak self] _ in
+                self?.copyToDocuments(at: node.path, name: node.name)
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Cancelar", style: .cancel))
+        if let popover = alert.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+        }
+        present(alert, animated: true)
     }
 }
 
@@ -146,6 +254,12 @@ extension FileBrowserViewController: UITableViewDelegate {
     func tableView(_ tv: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
         let node = nodes[indexPath.row]
 
+        let info = UIContextualAction(style: .normal, title: "Info") { [weak self] _, _, done in
+            self?.showFileInfo(for: node)
+            done(true)
+        }
+        info.backgroundColor = .systemBlue
+
         let share = UIContextualAction(style: .normal, title: "Compartir") { [weak self] _, _, done in
             self?.shareFile(at: node.path)
             done(true)
@@ -163,6 +277,35 @@ extension FileBrowserViewController: UITableViewDelegate {
             done(true)
         }
 
-        return UISwipeActionsConfiguration(actions: [delete, share, copy])
+        if node.isDirectory {
+            return UISwipeActionsConfiguration(actions: [delete, info])
+        }
+        return UISwipeActionsConfiguration(actions: [delete, share, copy, info])
+    }
+
+    func tableView(_ tv: UITableView, contextMenuConfigurationForRowAt indexPath: IndexPath, point: CGPoint) -> UIContextMenuConfiguration? {
+        let node = nodes[indexPath.row]
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
+            var actions: [UIAction] = []
+
+            actions.append(UIAction(title: "Copiar ruta", image: UIImage(systemName: "doc.on.doc")) { _ in
+                UIPasteboard.general.string = node.path
+            })
+
+            if !node.isDirectory {
+                actions.append(UIAction(title: "Compartir", image: UIImage(systemName: "square.and.arrow.up")) { _ in
+                    self?.shareFile(at: node.path)
+                })
+                actions.append(UIAction(title: "Copiar a Documents", image: UIImage(systemName: "arrow.down.doc")) { _ in
+                    self?.copyToDocuments(at: node.path, name: node.name)
+                })
+            }
+
+            actions.append(UIAction(title: "Eliminar", image: UIImage(systemName: "trash"), attributes: .destructive) { _ in
+                self?.deleteFile(at: indexPath)
+            })
+
+            return UIMenu(children: actions)
+        }
     }
 }

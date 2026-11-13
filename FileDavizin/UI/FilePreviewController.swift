@@ -128,7 +128,8 @@ final class FilePreviewController: UIViewController {
     }
 
     private func addImagePreview() {
-        guard let image = UIImage(contentsOfFile: node.path) else { return }
+        guard let data = FileAccessBridge.readFile(at: node.path),
+              let image = UIImage(data: data) else { return }
         let imageView = UIImageView(image: image)
         imageView.contentMode = .scaleAspectFit
         imageView.clipsToBounds = true
@@ -138,7 +139,7 @@ final class FilePreviewController: UIViewController {
     }
 
     private func addTextPreview() {
-        guard let data = FileManager.default.contents(atPath: node.path),
+        guard let data = FileAccessBridge.readFile(at: node.path),
               let text = String(data: data, encoding: .utf8) else { return }
         let textView = UITextView()
         textView.text = String(text.prefix(50_000))
@@ -153,6 +154,7 @@ final class FilePreviewController: UIViewController {
     }
 
     private func addPlistPreview() {
+        let _ = FileAccessBridge.grantAccess(path: (node.path as NSString).deletingLastPathComponent)
         if let dict = NSDictionary(contentsOfFile: node.path) {
             addFormattedDictPreview(dict as! [String: Any])
         } else if let arr = NSArray(contentsOfFile: node.path) {

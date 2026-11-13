@@ -12,8 +12,23 @@ struct AppContainer: Hashable {
         return identifier
     }
 
+    var shortIdentifier: String {
+        let parts = identifier.split(separator: ".")
+        if parts.count > 2 {
+            return parts.suffix(2).joined(separator: ".")
+        }
+        return identifier
+    }
+
     var iconLetter: String {
         String(displayName.prefix(1)).uppercased()
+    }
+
+    var containerSize: String {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return "N/A" }
+        guard let contents = try? fm.contentsOfDirectory(atPath: path) else { return "N/A" }
+        return "\(contents.count) items"
     }
 
     var metadataIdentifier: String? {

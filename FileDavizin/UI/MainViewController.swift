@@ -3,25 +3,86 @@ import UIKit
 final class MainViewController: UIViewController {
     private let appsVC = AppsViewController()
     private let systemVC = FileBrowserViewController(
-        path: "/private/var/mobile/Containers/Data/Application",
+        path: "/private/var/mobile",
         title: "Sistema")
+    private let settingsVC = SettingsViewController()
 
     private let containerView = UIView()
     private let bottomBar = UIView()
     private let appsButton = UIButton(type: .system)
     private let systemButton = UIButton(type: .system)
+    private let settingsButton = UIButton(type: .system)
     private let indicator = UIView()
+
+    private let statusBanner = UILabel()
+    private var statusBannerHeight: NSLayoutConstraint!
 
     private var currentChild: UIViewController?
     private var selectedIndex = 0
+    private var statusObserver: NSObjectProtocol?
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = FDTheme.background
+        setupStatusBanner()
         setupBottomBar()
         setupContainer()
         selectTab(0, animated: false)
-        initializeEngine()
+
+        statusObserver = NotificationCenter.default.addObserver(
+            forName: SandboxManager.statusDidChange,
+            object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let status = notification.object as? SandboxStatus else { return }
+            self?.updateBanner(status)
+        }
+
+        SandboxManager.shared.prepareAccess()
+    }
+
+    deinit {
+        if let observer = statusObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    private func setupStatusBanner() {
+        statusBanner.text = "Preparando acceso al sistema..."
+        statusBanner.textAlignment = .center
+        statusBanner.font = .systemFont(ofSize: 12, weight: .semibold)
+        statusBanner.textColor = .white
+        statusBanner.backgroundColor = FDTheme.accent.withAlphaComponent(0.9)
+        statusBanner.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(statusBanner)
+
+        statusBannerHeight = statusBanner.heightAnchor.constraint(equalToConstant: 28)
+        NSLayoutConstraint.activate([
+            statusBanner.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            statusBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            statusBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            statusBannerHeight,
+        ])
+    }
+
+    private func updateBanner(_ status: SandboxStatus) {
+        switch status {
+        case .idle, .initializing:
+            statusBanner.text = "Preparando acceso al sistema..."
+            statusBanner.backgroundColor = FDTheme.accent.withAlphaComponent(0.9)
+            statusBannerHeight.constant = 28
+        case .ready(let method):
+            statusBanner.text = "Acceso activo — \(method)"
+            statusBanner.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.85)
+            UIView.animate(withDuration: 2.0, delay: 1.5) {
+                self.statusBannerHeight.constant = 0
+                self.statusBanner.alpha = 0
+                self.view.layoutIfNeeded()
+            }
+        case .failed(let msg):
+            statusBanner.text = "Error: \(msg)"
+            statusBanner.backgroundColor = UIColor.systemRed.withAlphaComponent(0.85)
+            statusBannerHeight.constant = 28
+        }
     }
 
     private func setupContainer() {
@@ -46,9 +107,10 @@ final class MainViewController: UIViewController {
         bottomBar.addSubview(separator)
 
         configureTabButton(appsButton, title: "Apps", icon: "square.grid.2x2", tag: 0)
-        configureTabButton(systemButton, title: "Sistema", icon: "internaldrive", tag: 1)
+        configureTabButton(systemButton, title: "Sistema", icon: "folder", tag: 1)
+        configureTabButton(settingsButton, title: "Info", icon: "gear", tag: 2)
 
-        let stack = UIStackView(arrangedSubviews: [appsButton, systemButton])
+        let stack = UIStackView(arrangedSubviews: [appsButton, systemButton, settingsButton])
         stack.axis = .horizontal
         stack.distribution = .fillEqually
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -104,7 +166,8 @@ final class MainViewController: UIViewController {
     private func selectTab(_ index: Int, animated: Bool) {
         selectedIndex = index
 
-        let target = index == 0 ? appsVC : systemVC as UIViewController
+        let controllers: [UIViewController] = [appsVC, systemVC, settingsVC]
+        let target = controllers[index]
         let targetNav = UINavigationController(rootViewController: target)
         targetNav.navigationBar.prefersLargeTitles = false
         targetNav.navigationBar.barTintColor = FDTheme.background
@@ -129,21 +192,15 @@ final class MainViewController: UIViewController {
         targetNav.didMove(toParent: self)
         currentChild = targetNav
 
-        let buttons = [appsButton, systemButton]
+        let buttons = [appsButton, systemButton, settingsButton]
         for (i, btn) in buttons.enumerated() {
             btn.configuration?.baseForegroundColor = i == index ? FDTheme.accent : FDTheme.tertiaryText
         }
 
-        let anchor = index == 0 ? appsButton : systemButton
+        let anchor = buttons[index]
         let duration = animated ? 0.25 : 0
         UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut) {
             self.indicator.center.x = anchor.center.x
-        }
-    }
-
-    private func initializeEngine() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            FileAccessBridge.initialize()
         }
     }
 }
