@@ -5,7 +5,8 @@
 NS_ASSUME_NONNULL_BEGIN
 
 /// Initialize the container engine — performs initial symlink sandbox escape.
-void FDContainerEngineInit(void);
+/// Returns the number of base paths that are accessible after init.
+int FDContainerEngineInit(void);
 
 /// Discover the data container path for a given bundle ID.
 NSString * _Nullable FDDiscoverContainerPath(NSString *bundleID);

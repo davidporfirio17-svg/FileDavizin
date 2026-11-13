@@ -2,7 +2,7 @@ import UIKit
 
 enum FileAccessBridge {
     static func initialize() {
-        FDContainerEngineInit()
+        _ = FDContainerEngineInit()
     }
 
     static func discoverContainer(bundleID: String) -> String? {
