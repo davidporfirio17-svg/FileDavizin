@@ -103,11 +103,11 @@ final class SandboxManager {
         NSLog("[FD] kexploit OK, running sandbox_escape...")
         let selfProc = proc_self()
         let escapeResult = sandbox_escape(selfProc)
-        let active = sandbox_access_is_active() != 0
+        let activeAfterEscape = sandbox_access_is_active() != 0
 
-        NSLog("[FD] sandbox_escape=%d active=%d", escapeResult, active ? 1 : 0)
+        NSLog("[FD] sandbox_escape=%d active=%d", escapeResult, activeAfterEscape ? 1 : 0)
 
-        if active {
+        if activeAfterEscape {
             let _ = sandbox_set_platform_binary(selfProc)
             return .ready(method: "kexploit + sandbox_escape")
         }
