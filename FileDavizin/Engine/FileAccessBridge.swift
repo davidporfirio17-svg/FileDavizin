@@ -6,7 +6,8 @@ enum FileAccessBridge {
     }
 
     static func discoverContainer(bundleID: String) -> String? {
-        FDDiscoverContainerPath(bundleID as NSString) as String?
+        guard let result = FDDiscoverContainerPath(bundleID as NSString) else { return nil }
+        return result as String
     }
 
     static func grantAccess(path: String) -> Int64 {
