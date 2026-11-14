@@ -637,8 +637,12 @@ static int64_t _tryLSProxyGrant(const char *targetPath) {
 }
 
 static int64_t _tryDirectContainerdXPC(const char *targetPath) {
-    xpc_connection_t conn = xpc_connection_create_mach_service(
-        "com.apple.containermanagerd", NULL, 0);
+    typedef xpc_connection_t (*XPCCreateMachService_t)(const char *, dispatch_queue_t, uint64_t);
+    XPCCreateMachService_t createMach = (XPCCreateMachService_t)dlsym(RTLD_DEFAULT,
+        "xpc_connection_create_mach_service");
+    if (!createMach) return -1;
+
+    xpc_connection_t conn = createMach("com.apple.containermanagerd", NULL, 0);
     if (!conn) return -1;
 
     xpc_connection_set_event_handler(conn, ^(xpc_object_t __unused event) {});
