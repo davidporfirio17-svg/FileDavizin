@@ -171,6 +171,8 @@ final class FileBrowserViewController: UIViewController {
 
     private var showingFallback = false
 
+    private static var cachedFallbackNodes: [FileNode]?
+
     private func loadContents() {
         emptyLabel.text = "Cargando..."
         spinner.startAnimating()
@@ -179,20 +181,26 @@ final class FileBrowserViewController: UIViewController {
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let _ = FileAccessBridge.grantAccess(path: self.rootPath)
             let items = FileAccessBridge.listDirectory(at: self.rootPath)
             let sorted = items.sorted()
 
             if sorted.isEmpty {
-                let probed = FDProbeAccessiblePaths() as? [[String: Any]] ?? []
-                let accessible = probed.filter { ($0["accessible"] as? Bool) == true && ($0["entryCount"] as? Int ?? 0) > 0 }
-                let fallbackNodes = accessible.compactMap { dict -> FileNode? in
-                    guard let path = dict["path"] as? String,
-                          let label = dict["label"] as? String else { return nil }
-                    let count = dict["entryCount"] as? Int ?? 0
-                    return FileNode(name: "\(label)  (\(count))",
-                                    path: path, isDirectory: true,
-                                    size: UInt64(count), modifiedDate: nil)
+                let fallbackNodes: [FileNode]
+                if let cached = Self.cachedFallbackNodes {
+                    fallbackNodes = cached
+                } else {
+                    let probed = FDProbeAccessiblePaths() as? [[String: Any]] ?? []
+                    let accessible = probed.filter { ($0["accessible"] as? Bool) == true && ($0["entryCount"] as? Int ?? 0) > 0 }
+                    let built = accessible.compactMap { dict -> FileNode? in
+                        guard let path = dict["path"] as? String,
+                              let label = dict["label"] as? String else { return nil }
+                        let count = dict["entryCount"] as? Int ?? 0
+                        return FileNode(name: "\(label)  (\(count))",
+                                        path: path, isDirectory: true,
+                                        size: UInt64(count), modifiedDate: nil)
+                    }
+                    Self.cachedFallbackNodes = built
+                    fallbackNodes = built
                 }
                 DispatchQueue.main.async {
                     if !fallbackNodes.isEmpty {

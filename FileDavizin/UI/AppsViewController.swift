@@ -119,14 +119,12 @@ final class AppsViewController: UIViewController {
         spinner.startAnimating()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            var containers = FileAccessBridge.discoverAllContainers()
-            // Pre-compute sizes in background so cells don't do IPC
-            for i in containers.indices {
-                containers[i].computeSize()
-            }
+            let containers = FileAccessBridge.discoverAllContainers()
+            let sorted = containers.sorted { $0.identifier < $1.identifier }
+
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.allContainers = containers.sorted { $0.identifier < $1.identifier }
+                self.allContainers = sorted
                 self.applyFilter()
                 self.isScanning = false
                 self.spinner.stopAnimating()
@@ -137,6 +135,28 @@ final class AppsViewController: UIViewController {
                     self.statusLabel.text = nil
                 }
                 self.updateTitle()
+            }
+
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                for i in sorted.indices {
+                    var c = sorted[i]
+                    c.computeSize()
+                    let size = c.cachedSize
+                    let ident = c.identifier
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if let idx = self.allContainers.firstIndex(where: { $0.identifier == ident }) {
+                            self.allContainers[idx].cachedSize = size
+                        }
+                        if let visIdx = self.filteredContainers.firstIndex(where: { $0.identifier == ident }) {
+                            self.filteredContainers[visIdx].cachedSize = size
+                            let ip = IndexPath(item: visIdx, section: 0)
+                            if let cell = self.collectionView.cellForItem(at: ip) as? AppCell {
+                                cell.configure(with: self.filteredContainers[visIdx])
+                            }
+                        }
+                    }
+                }
             }
         }
     }

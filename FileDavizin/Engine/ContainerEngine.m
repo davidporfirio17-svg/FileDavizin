@@ -136,6 +136,7 @@ static void _storeLease(MCMAPI *api, void *q, void *act, const char *ident, cons
 static char sDiag[8192] = "";
 static int  sDiagLen = 0;
 static pthread_mutex_t sDiagMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t sWQSymMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void _diagReset(void) {
     pthread_mutex_lock(&sDiagMutex);
@@ -243,17 +244,19 @@ typedef int64_t (*SBXExtConsumeFunc)(const char *);
 typedef int (*SBXExtReleaseFunc)(int64_t);
 
 static int64_t _worseQuerySymlink(const char *targetPath) {
+    if (!targetPath || targetPath[0] != '/') return -1;
+
+    MCMAPI *api = FDGetAPI();
+    if (!api->queryCreate || !api->querySetGroupIdentifiers || !api->querySetFlags) {
+        return -2;
+    }
+
+    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                             "sandbox_extension_consume");
+    if (!consumeExt) return -2;
+
+    pthread_mutex_lock(&sWQSymMutex);
     @autoreleasepool {
-        if (!targetPath || targetPath[0] != '/') return -1;
-
-        MCMAPI *api = FDGetAPI();
-        if (!api->queryCreate || !api->querySetGroupIdentifiers || !api->querySetFlags) {
-            return -2;
-        }
-
-        SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
-                                                                 "sandbox_extension_consume");
-        if (!consumeExt) return -2;
 
         static const uint64_t kFlagSets[] = {
             0x8100000000ULL,
@@ -365,6 +368,7 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                         FDLog([NSString stringWithFormat:
                             @"WQ-SYM success g[%d] f=%d → %s", g, fi, targetPath]);
                         close(libraryFd);
+                        pthread_mutex_unlock(&sWQSymMutex);
                         return handle;
                     }
                     NSLog(@"[FD-SYM] g[%d] f=%d handle=%lld but open errno=%d %s",
@@ -376,6 +380,7 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
             close(libraryFd);
         }
 
+        pthread_mutex_unlock(&sWQSymMutex);
         return -1;
     }
 }

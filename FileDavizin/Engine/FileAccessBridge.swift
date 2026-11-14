@@ -63,20 +63,10 @@ enum FileAccessBridge {
         }
 
         let fm = FileManager.default
-        let _ = grantAccess(path: path)
         if let entries = try? fm.contentsOfDirectory(atPath: path) {
             return entries.compactMap { name in
                 fileNode(name: name, parentPath: path)
             }.sorted()
-        }
-        let parent = (path as NSString).deletingLastPathComponent
-        if parent.count > 1 {
-            let _ = grantAccess(path: parent)
-            if let entries = try? fm.contentsOfDirectory(atPath: path) {
-                return entries.compactMap { name in
-                    fileNode(name: name, parentPath: path)
-                }.sorted()
-            }
         }
         NSLog("[FD] listDirectory FAILED: %@", path)
         return []
