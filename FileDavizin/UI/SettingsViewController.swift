@@ -7,7 +7,11 @@ final class SettingsViewController: UIViewController {
     private struct Row {
         let title: String
         let detail: String
+        let icon: String?
         let action: (() -> Void)?
+        init(title: String, detail: String, icon: String? = nil, action: (() -> Void)? = nil) {
+            self.title = title; self.detail = detail; self.icon = icon; self.action = action
+        }
     }
 
     private var sections: [(title: String, rows: [Row])] = []
@@ -51,52 +55,99 @@ final class SettingsViewController: UIViewController {
     private func rebuildData() {
         let status = SandboxManager.shared.status
 
-        var deviceRows: [Row] = [
-            Row(title: "Dispositivo", detail: FDDeviceInfo.deviceModel, action: nil),
-            Row(title: "iOS", detail: FDDeviceInfo.systemDescription, action: nil),
-            Row(title: "Hardware", detail: FDDeviceInfo.displayMachineName, action: nil),
+        let deviceRows: [Row] = [
+            Row(title: "Dispositivo", detail: FDDeviceInfo.deviceModel),
+            Row(title: "iOS", detail: FDDeviceInfo.systemDescription),
+            Row(title: "Hardware", detail: FDDeviceInfo.displayMachineName),
+            Row(title: "Compatibilidad",
+                detail: FDSupportPolicy.isCurrentSystemSupported
+                    ? "Compatible (\(FDSupportPolicy.supportedRangesDescription))"
+                    : "No compatible"),
         ]
 
-        let compatible = FDSupportPolicy.isCurrentSystemSupported
-        deviceRows.append(Row(
-            title: "Compatibilidad",
-            detail: compatible ? "Compatible (\(FDSupportPolicy.supportedRangesDescription))" : "No compatible",
-            action: nil
-        ))
-
         let engineRows: [Row] = [
-            Row(title: "Estado", detail: status.displayText, action: nil),
-            Row(title: "Diagnóstico", detail: String(cString: FDLastDiagnostic()), action: nil),
-            Row(title: "Ejecutar diagnóstico completo", detail: "Prueba todas las rutas y copia al clipboard", action: { [weak self] in
+            Row(title: "Estado", detail: status.displayText),
+            Row(title: "Diagnostico", detail: String(cString: FDLastDiagnostic())),
+            Row(title: "Ejecutar diagnostico completo", detail: "Prueba todas las rutas y copia al clipboard", action: { [weak self] in
                 self?.runFullDiagnostic()
             }),
         ]
 
-        let pathRows: [Row] = [
-            Row(title: "/var/mobile", detail: "Raíz del usuario", action: { [weak self] in
+        let goToRow: [Row] = [
+            Row(title: "Ir a ruta...", detail: "Escribe cualquier ruta del filesystem", icon: "magnifyingglass", action: { [weak self] in
+                self?.promptGoToPath()
+            }),
+        ]
+
+        let userRows: [Row] = [
+            Row(title: "/var/mobile", detail: "Raiz del usuario", icon: "person.fill", action: { [weak self] in
                 self?.browsePath("/private/var/mobile", title: "/var/mobile")
             }),
-            Row(title: "App Containers", detail: "Datos de aplicaciones", action: { [weak self] in
+            Row(title: "App Containers", detail: "Datos de aplicaciones", icon: "app.badge", action: { [weak self] in
                 self?.browsePath("/private/var/mobile/Containers/Data/Application", title: "App Containers")
             }),
-            Row(title: "App Groups", detail: "Grupos compartidos", action: { [weak self] in
+            Row(title: "App Groups", detail: "Grupos compartidos", icon: "square.stack.3d.up", action: { [weak self] in
                 self?.browsePath("/private/var/mobile/Containers/Shared/AppGroup", title: "App Groups")
             }),
-            Row(title: "Media", detail: "Fotos, música, etc.", action: { [weak self] in
+            Row(title: "Media", detail: "Fotos, musica, videos", icon: "photo.on.rectangle", action: { [weak self] in
                 self?.browsePath("/private/var/mobile/Media", title: "Media")
             }),
-            Row(title: "/var/mobile/Library", detail: "Preferencias del sistema", action: { [weak self] in
+            Row(title: "Library", detail: "Preferencias y caches del usuario", icon: "books.vertical", action: { [weak self] in
                 self?.browsePath("/private/var/mobile/Library", title: "Library")
             }),
-            Row(title: "/var/mobile/Documents", detail: "Documentos del usuario", action: { [weak self] in
+            Row(title: "Documents", detail: "Documentos del usuario", icon: "doc.text", action: { [weak self] in
                 self?.browsePath("/private/var/mobile/Documents", title: "Documents")
+            }),
+        ]
+
+        let systemRows: [Row] = [
+            Row(title: "/", detail: "Raiz del filesystem", icon: "externaldrive.fill", action: { [weak self] in
+                self?.browsePath("/", title: "/")
+            }),
+            Row(title: "/System/Library", detail: "Frameworks, daemons, plists del sistema", icon: "gearshape.2", action: { [weak self] in
+                self?.browsePath("/System/Library", title: "System Library")
+            }),
+            Row(title: "/usr", detail: "Binarios y librerias del sistema", icon: "terminal", action: { [weak self] in
+                self?.browsePath("/usr", title: "/usr")
+            }),
+            Row(title: "/etc", detail: "Configuracion del sistema", icon: "wrench.and.screwdriver", action: { [weak self] in
+                self?.browsePath("/private/etc", title: "/etc")
+            }),
+            Row(title: "/var", detail: "Datos variables del sistema", icon: "internaldrive", action: { [weak self] in
+                self?.browsePath("/private/var", title: "/var")
+            }),
+            Row(title: "/var/root", detail: "Home de root", icon: "person.badge.key", action: { [weak self] in
+                self?.browsePath("/private/var/root", title: "/var/root")
+            }),
+            Row(title: "/var/db", detail: "Bases de datos del sistema", icon: "cylinder", action: { [weak self] in
+                self?.browsePath("/private/var/db", title: "/var/db")
+            }),
+            Row(title: "/var/logs", detail: "Logs del sistema", icon: "doc.text.magnifyingglass", action: { [weak self] in
+                self?.browsePath("/private/var/logs", title: "/var/logs")
+            }),
+            Row(title: "/var/preferences", detail: "Preferencias globales", icon: "slider.horizontal.3", action: { [weak self] in
+                self?.browsePath("/private/var/preferences", title: "Preferences")
+            }),
+            Row(title: "/var/MobileDevice", detail: "Provisioning profiles, logs", icon: "iphone", action: { [weak self] in
+                self?.browsePath("/private/var/MobileDevice", title: "MobileDevice")
+            }),
+            Row(title: "/var/containers", detail: "Todos los containers del sistema", icon: "shippingbox", action: { [weak self] in
+                self?.browsePath("/private/var/containers", title: "Containers")
+            }),
+            Row(title: "/var/installd", detail: "Estado de instalacion", icon: "arrow.down.app", action: { [weak self] in
+                self?.browsePath("/private/var/installd", title: "installd")
+            }),
+            Row(title: "/Library", detail: "Library del sistema (raiz)", icon: "building.columns", action: { [weak self] in
+                self?.browsePath("/Library", title: "/Library")
             }),
         ]
 
         sections = [
             (title: "Dispositivo", rows: deviceRows),
             (title: "Motor de acceso", rows: engineRows),
-            (title: "Explorar rutas", rows: pathRows),
+            (title: "Ir a ruta", rows: goToRow),
+            (title: "Rutas de usuario", rows: userRows),
+            (title: "Rutas del sistema (root)", rows: systemRows),
         ]
 
         tableView.reloadData()
@@ -107,8 +158,31 @@ final class SettingsViewController: UIViewController {
         navigationController?.pushViewController(browser, animated: true)
     }
 
+    private func promptGoToPath() {
+        let alert = UIAlertController(
+            title: "Ir a ruta",
+            message: "Escribe la ruta completa del directorio",
+            preferredStyle: .alert)
+        alert.addTextField { tf in
+            tf.placeholder = "/private/var/mobile"
+            tf.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
+            tf.autocapitalizationType = .none
+            tf.autocorrectionType = .no
+            tf.keyboardType = .URL
+        }
+        alert.addAction(UIAlertAction(title: "Cancelar", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Ir", style: .default) { [weak self] _ in
+            guard let path = alert.textFields?.first?.text, !path.isEmpty else { return }
+            var resolved = path
+            if !resolved.hasPrefix("/") { resolved = "/" + resolved }
+            let title = (resolved as NSString).lastPathComponent
+            self?.browsePath(resolved, title: title.isEmpty ? "/" : title)
+        })
+        present(alert, animated: true)
+    }
+
     private func runFullDiagnostic() {
-        let alert = UIAlertController(title: "Ejecutando diagnóstico...", message: nil, preferredStyle: .alert)
+        let alert = UIAlertController(title: "Ejecutando diagnostico...", message: nil, preferredStyle: .alert)
         present(alert, animated: true)
         DispatchQueue.global(qos: .userInitiated).async {
             let report = FDRunFullDiagnostic()
@@ -116,8 +190,8 @@ final class SettingsViewController: UIViewController {
                 alert.dismiss(animated: true) {
                     UIPasteboard.general.string = report
                     let done = UIAlertController(
-                        title: "Diagnóstico copiado",
-                        message: "El reporte fue copiado al clipboard. Pégalo para compartirlo.",
+                        title: "Diagnostico copiado",
+                        message: "El reporte fue copiado al clipboard. Pegalo para compartirlo.",
                         preferredStyle: .alert
                     )
                     done.addAction(UIAlertAction(title: "OK", style: .default))
@@ -152,6 +226,10 @@ extension SettingsViewController: UITableViewDataSource {
         config.secondaryTextProperties.color = FDTheme.secondaryText
         config.secondaryTextProperties.font = .systemFont(ofSize: 12)
         config.secondaryTextProperties.numberOfLines = 3
+        if let iconName = row.icon {
+            config.image = UIImage(systemName: iconName)
+            config.imageProperties.tintColor = FDTheme.accent
+        }
         cell.contentConfiguration = config
         cell.backgroundColor = FDTheme.card
         cell.accessoryType = row.action != nil ? .disclosureIndicator : .none
