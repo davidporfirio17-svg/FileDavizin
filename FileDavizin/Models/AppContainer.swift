@@ -38,11 +38,6 @@ struct AppContainer: Hashable {
         guard fm.fileExists(atPath: path) else { cachedSize = "N/A"; return }
         if let contents = try? fm.contentsOfDirectory(atPath: path) {
             cachedSize = "\(contents.count) items"
-            return
-        }
-        let _ = FDGrantAccess(path)
-        if let contents = try? fm.contentsOfDirectory(atPath: path) {
-            cachedSize = "\(contents.count) items"
         } else {
             cachedSize = "---"
         }

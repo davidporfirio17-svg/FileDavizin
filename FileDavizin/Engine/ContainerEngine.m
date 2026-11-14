@@ -530,10 +530,13 @@ static void _attemptSandboxRelax(void) {
 }
 
 static int64_t _tryContainerCreateLookup(const char *targetPath) {
+    static int sLookupFailed = 0;
+    if (sLookupFailed) return -1;
+
     typedef const char *(*ContainerLookup_t)(uint64_t, const char *, void **, char **);
     ContainerLookup_t lookup = (ContainerLookup_t)dlsym(RTLD_DEFAULT,
         "container_create_or_lookup_path_for_current_user");
-    if (!lookup) return -1;
+    if (!lookup) { sLookupFailed = 1; return -1; }
 
     SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
                                                              "sandbox_extension_consume");
@@ -570,27 +573,30 @@ static int64_t _tryContainerCreateLookup(const char *targetPath) {
             free(token);
         }
     }
+    sLookupFailed = 1;
     return -1;
 }
 
+static NSArray *_cachedLSApps(void) {
+    static NSArray *sApps = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class LSAppWorkspace = NSClassFromString(@"LSApplicationWorkspace");
+        if (!LSAppWorkspace) return;
+        id workspace = [LSAppWorkspace performSelector:@selector(defaultWorkspace)];
+        if (!workspace) return;
+        @try {
+            sApps = [workspace performSelector:@selector(allInstalledApplications)];
+        } @catch (NSException *e) {
+            NSLog(@"[FD-LS] allInstalledApplications exception: %@", e);
+        }
+    });
+    return sApps;
+}
+
 static int64_t _tryLSProxyGrant(const char *targetPath) {
-    Class LSAppProxy = NSClassFromString(@"LSApplicationProxy");
-    Class LSAppWorkspace = NSClassFromString(@"LSApplicationWorkspace");
-    if (!LSAppProxy || !LSAppWorkspace) return -1;
-
-    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
-                                                             "sandbox_extension_consume");
-
-    id workspace = [LSAppWorkspace performSelector:@selector(defaultWorkspace)];
-    if (!workspace) return -1;
-
-    NSArray *allApps = nil;
-    @try {
-        allApps = [workspace performSelector:@selector(allInstalledApplications)];
-    } @catch (NSException *e) {
-        NSLog(@"[FD-LS] allInstalledApplications exception: %@", e);
-        return -1;
-    }
+    NSArray *allApps = _cachedLSApps();
+    if (!allApps.count) return -1;
 
     NSString *target = [NSString stringWithUTF8String:targetPath];
 
@@ -611,8 +617,6 @@ static int64_t _tryLSProxyGrant(const char *targetPath) {
 
             if ([target hasPrefix:containerPath] || [target isEqualToString:containerPath]) {
                 BOOL started = [dataURL startAccessingSecurityScopedResource];
-                NSLog(@"[FD-LS] security-scoped start=%d for %@", started, containerPath);
-
                 if (started) {
                     int fd = open(targetPath, O_RDONLY | O_CLOEXEC);
                     if (fd >= 0) {
@@ -637,13 +641,16 @@ static int64_t _tryLSProxyGrant(const char *targetPath) {
 }
 
 static int64_t _tryDirectContainerdXPC(const char *targetPath) {
+    static int sXPCFailed = 0;
+    if (sXPCFailed) return -1;
+
     typedef xpc_connection_t (*XPCCreateMachService_t)(const char *, dispatch_queue_t, uint64_t);
     XPCCreateMachService_t createMach = (XPCCreateMachService_t)dlsym(RTLD_DEFAULT,
         "xpc_connection_create_mach_service");
-    if (!createMach) return -1;
+    if (!createMach) { sXPCFailed = 1; return -1; }
 
     xpc_connection_t conn = createMach("com.apple.containermanagerd", NULL, 0);
-    if (!conn) return -1;
+    if (!conn) { sXPCFailed = 1; return -1; }
 
     xpc_connection_set_event_handler(conn, ^(xpc_object_t __unused event) {});
     xpc_connection_resume(conn);
@@ -662,7 +669,16 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
         xpc_dictionary_set_bool(msg, "activate", true);
         xpc_dictionary_set_string(msg, "bundle-id", "com.apple.mobile.MobileHouseArrest");
 
-        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, msg);
+        __block xpc_object_t reply = NULL;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        xpc_connection_send_message_with_reply(conn, msg, dispatch_get_global_queue(0, 0),
+            ^(xpc_object_t r) { reply = r; dispatch_semaphore_signal(sem); });
+        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 500000000LL));
+        if (waited != 0) {
+            NSLog(@"[FD-XPC] timeout op=%llu", kOps[oi]);
+            continue;
+        }
+
         if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
             const char *token = xpc_dictionary_get_string(reply, "sandbox-extension");
             if (!token) token = xpc_dictionary_get_string(reply, "token");
@@ -683,6 +699,7 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
     }
 
     xpc_connection_cancel(conn);
+    if (result < 0) sXPCFailed = 1;
     return result;
 }
 
@@ -2224,14 +2241,6 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
                 }
             }
         } else {
-            // Couldn't stat — try granting access to the entry itself
-            FDGrantAccess(fullPath);
-            if (lstat(fullPath, &st) == 0) {
-                isDir = S_ISDIR(st.st_mode);
-                size = (uint64_t)st.st_size;
-                modTime = (double)st.st_mtimespec.tv_sec;
-            }
-            // Still include it even without stat — the name alone is valuable
             if (entry->d_type == DT_DIR) isDir = YES;
         }
 
