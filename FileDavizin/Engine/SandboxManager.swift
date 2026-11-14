@@ -47,12 +47,13 @@ final class SandboxManager {
         }
     }
 
+    private(set) var hasFullEscape = false
+
     private func runEscapeSequence() -> SandboxStatus {
         let ver = FDDeviceInfo.versionTuple
-        let requiresPairing = ver.major >= 27
 
-        NSLog("[FD] Escape sequence: iOS %d.%d.%d requiresPairing=%d",
-              ver.major, ver.minor, ver.patch, requiresPairing ? 1 : 0)
+        NSLog("[FD] Escape sequence: iOS %d.%d.%d",
+              ver.major, ver.minor, ver.patch)
 
         // Step 1: Initialize container engine (WQ-SYM + WQ-PD + MCM-C7 + BQ)
         let accessible = FDContainerEngineInit()
@@ -61,58 +62,55 @@ final class SandboxManager {
         NSLog("[FD] Engine init result: accessible=%d sandbox_active=%d",
               accessible, active)
 
-        // Step 2: Check escape status
-        if requiresPairing {
-            if active != 0 {
-                NSLog("[FD] iOS 27+: sandbox escape VERIFIED")
-                return .ready(method: "WQ-SYM")
-            }
-            if accessible > 0 {
-                NSLog("[FD] iOS 27+: partial access (%d paths), scan may work", accessible)
-                return .ready(method: "WQ-SYM (parcial \(accessible))")
-            }
-            NSLog("[FD] iOS 27+: no verified access, will try per-container grants")
-            return .ready(method: "WQ (sin verificar)")
-        }
-
-        if active != 0 {
-            NSLog("[FD] Sandbox already active after init")
-            return .ready(method: "WQ-SYM")
-        }
-
-        // Step 3: Check if kernel offsets are supported for kexploit
+        // Step 2: Always try kexploit for full jailbreak-like access
         let supportsKernel = FDSupportPolicy.isSupported(
             major: ver.major, minor: ver.minor, patch: ver.patch
         )
-        guard supportsKernel else {
-            NSLog("[FD] No kernel offsets for iOS %d.%d — WQ-SYM only mode", ver.major, ver.minor)
-            return .ready(method: "WQ-SYM (parcial)")
+
+        if supportsKernel {
+            NSLog("[FD] Kernel offsets available, running kexploit_opa334...")
+            let exploitResult = kexploit_opa334()
+
+            if exploitResult == 0 {
+                NSLog("[FD] kexploit OK, running sandbox_escape...")
+                let selfProc = proc_self()
+
+                let escapeResult = sandbox_escape(selfProc)
+                NSLog("[FD] sandbox_escape result: %d", escapeResult)
+
+                let _ = sandbox_set_platform_binary(selfProc)
+                NSLog("[FD] sandbox_set_platform_binary done")
+
+                let rootResult = sandbox_elevate_to_root(selfProc)
+                NSLog("[FD] sandbox_elevate_to_root result: %d", rootResult)
+
+                let activeAfterEscape = sandbox_access_is_active() != 0
+                NSLog("[FD] sandbox_active after full escape: %d", activeAfterEscape ? 1 : 0)
+
+                if activeAfterEscape {
+                    hasFullEscape = true
+                    return .ready(method: "kexploit + root")
+                }
+
+                if escapeResult == 0 || rootResult == 0 {
+                    hasFullEscape = true
+                    return .ready(method: "kexploit (parcial)")
+                }
+            } else {
+                NSLog("[FD] kexploit failed: KXP-%d", abs(exploitResult))
+            }
+        } else {
+            NSLog("[FD] No kernel offsets for iOS %d.%d", ver.major, ver.minor)
         }
 
-        // Step 4: Try kexploit
-        NSLog("[FD] WQ-SYM insufficient, running kexploit_opa334...")
-        let exploitResult = kexploit_opa334()
-        guard exploitResult == 0 else {
-            let code = abs(exploitResult)
-            let msg = "KXP-\(code)"
-            NSLog("[FD] kexploit failed: %@", msg)
-            return .ready(method: "WQ-SYM (sin kexploit)")
+        // Step 3: Fallback to WQ-SYM access
+        if active != 0 {
+            return .ready(method: "WQ-SYM")
         }
-
-        // Step 5: Sandbox escape
-        NSLog("[FD] kexploit OK, running sandbox_escape...")
-        let selfProc = proc_self()
-        let escapeResult = sandbox_escape(selfProc)
-        let activeAfterEscape = sandbox_access_is_active() != 0
-
-        NSLog("[FD] sandbox_escape=%d active=%d", escapeResult, activeAfterEscape ? 1 : 0)
-
-        if activeAfterEscape {
-            let _ = sandbox_set_platform_binary(selfProc)
-            return .ready(method: "kexploit + sandbox_escape")
+        if accessible > 0 {
+            return .ready(method: "WQ-SYM (parcial \(accessible))")
         }
-
-        return .ready(method: "WQ-SYM (escape parcial)")
+        return .ready(method: "WQ (sin verificar)")
     }
 
     private func postStatus() {

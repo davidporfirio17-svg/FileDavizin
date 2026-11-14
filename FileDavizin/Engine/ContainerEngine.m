@@ -1798,17 +1798,28 @@ NSString *FDRunFullDiagnostic(void) {
 NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
     if (!dirPath) return @[];
 
-    // Grant access to the directory and its parent
-    FDGrantAccess(dirPath);
-    char parent[1024];
-    strlcpy(parent, dirPath, sizeof(parent));
-    char *slash = strrchr(parent, '/');
-    if (slash && slash != parent) {
-        *slash = '\0';
-        FDGrantAccess(parent);
+    // Try opening directly first (works if we have root/sandbox escape)
+    DIR *dp = opendir(dirPath);
+
+    if (!dp) {
+        // Grant access via worse_query and retry
+        FDGrantAccess(dirPath);
+        char parent[1024];
+        strlcpy(parent, dirPath, sizeof(parent));
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent) {
+            *slash = '\0';
+            FDGrantAccess(parent);
+        }
+        dp = opendir(dirPath);
     }
 
-    DIR *dp = opendir(dirPath);
+    if (!dp) {
+        // Last resort: try bad_query with multiple classes
+        bad_query((char *)dirPath, false, NULL, false);
+        dp = opendir(dirPath);
+    }
+
     if (!dp) {
         NSLog(@"[FD] FDListDirectoryRaw: opendir(%s) failed: %s", dirPath, strerror(errno));
         return @[];

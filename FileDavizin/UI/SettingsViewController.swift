@@ -65,8 +65,16 @@ final class SettingsViewController: UIViewController {
                     : "No compatible"),
         ]
 
+        let escapeLevel = SandboxManager.shared.hasFullEscape
+            ? "Jailbreak (root + sandbox escape)"
+            : "Parcial (WQ-SYM sandbox extensions)"
+
         let engineRows: [Row] = [
             Row(title: "Estado", detail: status.displayText),
+            Row(title: "Nivel de acceso", detail: escapeLevel,
+                icon: SandboxManager.shared.hasFullEscape ? "lock.open.fill" : "lock.fill"),
+            Row(title: "UID", detail: "uid=\(getuid()) euid=\(geteuid())",
+                icon: getuid() == 0 ? "person.badge.key" : "person"),
             Row(title: "Diagnostico", detail: String(cString: FDLastDiagnostic())),
             Row(title: "Ejecutar diagnostico completo", detail: "Prueba todas las rutas y copia al clipboard", action: { [weak self] in
                 self?.runFullDiagnostic()
