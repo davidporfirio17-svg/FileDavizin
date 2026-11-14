@@ -32,4 +32,9 @@ const char * _Nonnull FDLastDiagnostic(void);
 /// This tests every subsystem and logs results via NSLog.
 NSString *FDRunFullDiagnostic(void);
 
+/// Raw directory listing using POSIX opendir/readdir — shows ALL files
+/// including hidden ones. Grants sandbox access before listing.
+/// Returns array of dicts: name, path, isDir, size, modified, perms, isHidden.
+NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath);
+
 NS_ASSUME_NONNULL_END

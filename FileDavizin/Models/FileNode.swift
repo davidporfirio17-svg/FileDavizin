@@ -6,6 +6,21 @@ struct FileNode: Comparable {
     let isDirectory: Bool
     let size: UInt64
     let modifiedDate: Date?
+    let isHidden: Bool
+    let isSymlink: Bool
+    let permissions: String?
+
+    init(name: String, path: String, isDirectory: Bool, size: UInt64, modifiedDate: Date?,
+         isHidden: Bool = false, isSymlink: Bool = false, permissions: String? = nil) {
+        self.name = name
+        self.path = path
+        self.isDirectory = isDirectory
+        self.size = size
+        self.modifiedDate = modifiedDate
+        self.isHidden = isHidden
+        self.isSymlink = isSymlink
+        self.permissions = permissions
+    }
 
     static func < (lhs: FileNode, rhs: FileNode) -> Bool {
         if lhs.isDirectory != rhs.isDirectory { return lhs.isDirectory }

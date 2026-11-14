@@ -58,10 +58,23 @@ final class FileCell: UITableViewCell {
     }
 
     func configure(with node: FileNode) {
-        iconView.image = UIImage(systemName: node.iconName)
+        let iconName = node.isSymlink ? "arrow.triangle.turn.up.right.diamond" : node.iconName
+        iconView.image = UIImage(systemName: iconName)
         iconView.tintColor = node.isDirectory ? FDTheme.warm : FDTheme.accent
+        if node.isHidden {
+            nameLabel.textColor = FDTheme.tertiaryText
+            iconView.alpha = 0.5
+        } else {
+            nameLabel.textColor = FDTheme.primaryText
+            iconView.alpha = 1.0
+        }
         nameLabel.text = node.name
-        detailLabel.text = node.isDirectory ? "Carpeta" : node.displaySize
+        var detail = node.isDirectory ? "Carpeta" : node.displaySize
+        if let perms = node.permissions, perms != "?" {
+            detail += "  \(perms)"
+        }
+        if node.isSymlink { detail += "  (symlink)" }
+        detailLabel.text = detail
         dateLabel.text = node.displayDate
         accessoryType = node.isDirectory ? .disclosureIndicator : .none
     }

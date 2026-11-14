@@ -5,12 +5,14 @@ final class MainViewController: UIViewController {
     private let systemVC = FileBrowserViewController(
         path: "/private/var/mobile",
         title: "Sistema")
+    private let patchesVC = PatchesViewController()
     private let settingsVC = SettingsViewController()
 
     private let containerView = UIView()
     private let bottomBar = UIView()
     private let appsButton = UIButton(type: .system)
     private let systemButton = UIButton(type: .system)
+    private let patchesButton = UIButton(type: .system)
     private let settingsButton = UIButton(type: .system)
     private let indicator = UIView()
 
@@ -111,9 +113,10 @@ final class MainViewController: UIViewController {
 
         configureTabButton(appsButton, title: "Apps", icon: "square.grid.2x2", tag: 0)
         configureTabButton(systemButton, title: "Sistema", icon: "folder", tag: 1)
-        configureTabButton(settingsButton, title: "Info", icon: "gear", tag: 2)
+        configureTabButton(patchesButton, title: "Patches", icon: "bandage", tag: 2)
+        configureTabButton(settingsButton, title: "Info", icon: "gear", tag: 3)
 
-        let stack = UIStackView(arrangedSubviews: [appsButton, systemButton, settingsButton])
+        let stack = UIStackView(arrangedSubviews: [appsButton, systemButton, patchesButton, settingsButton])
         stack.axis = .horizontal
         stack.distribution = .fillEqually
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -205,7 +208,7 @@ final class MainViewController: UIViewController {
     private func selectTab(_ index: Int, animated: Bool) {
         selectedIndex = index
 
-        let controllers: [UIViewController] = [appsVC, systemVC, settingsVC]
+        let controllers: [UIViewController] = [appsVC, systemVC, patchesVC, settingsVC]
         let target = controllers[index]
         let targetNav = UINavigationController(rootViewController: target)
         targetNav.navigationBar.prefersLargeTitles = false
@@ -231,7 +234,7 @@ final class MainViewController: UIViewController {
         targetNav.didMove(toParent: self)
         currentChild = targetNav
 
-        let buttons = [appsButton, systemButton, settingsButton]
+        let buttons = [appsButton, systemButton, patchesButton, settingsButton]
         for (i, btn) in buttons.enumerated() {
             btn.configuration?.baseForegroundColor = i == index ? FDTheme.accent : FDTheme.tertiaryText
         }

@@ -1792,3 +1792,102 @@ NSString *FDRunFullDiagnostic(void) {
     NSLog(@"[FD-DIAG]\n%@", report);
     return report;
 }
+
+#pragma mark - Raw Directory Listing
+
+NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
+    if (!dirPath) return @[];
+
+    // Grant access to the directory and its parent
+    FDGrantAccess(dirPath);
+    char parent[1024];
+    strlcpy(parent, dirPath, sizeof(parent));
+    char *slash = strrchr(parent, '/');
+    if (slash && slash != parent) {
+        *slash = '\0';
+        FDGrantAccess(parent);
+    }
+
+    DIR *dp = opendir(dirPath);
+    if (!dp) {
+        NSLog(@"[FD] FDListDirectoryRaw: opendir(%s) failed: %s", dirPath, strerror(errno));
+        return @[];
+    }
+
+    NSMutableArray *results = [NSMutableArray array];
+    struct dirent *entry;
+    while ((entry = readdir(dp)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+        NSString *name = [NSString stringWithUTF8String:entry->d_name];
+        if (!name) continue;
+
+        char fullPath[2048];
+        snprintf(fullPath, sizeof(fullPath), "%s/%s", dirPath, entry->d_name);
+
+        struct stat st;
+        BOOL didStat = (lstat(fullPath, &st) == 0);
+
+        BOOL isDir = NO;
+        uint64_t size = 0;
+        double modTime = 0;
+        NSString *perms = @"?";
+        BOOL isHidden = (entry->d_name[0] == '.');
+        BOOL isSymlink = NO;
+
+        if (didStat) {
+            isDir = S_ISDIR(st.st_mode);
+            isSymlink = S_ISLNK(st.st_mode);
+            size = (uint64_t)st.st_size;
+            modTime = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
+
+            char p[11];
+            p[0] = S_ISDIR(st.st_mode) ? 'd' : S_ISLNK(st.st_mode) ? 'l' : '-';
+            p[1] = (st.st_mode & S_IRUSR) ? 'r' : '-';
+            p[2] = (st.st_mode & S_IWUSR) ? 'w' : '-';
+            p[3] = (st.st_mode & S_IXUSR) ? 'x' : '-';
+            p[4] = (st.st_mode & S_IRGRP) ? 'r' : '-';
+            p[5] = (st.st_mode & S_IWGRP) ? 'w' : '-';
+            p[6] = (st.st_mode & S_IXGRP) ? 'x' : '-';
+            p[7] = (st.st_mode & S_IROTH) ? 'r' : '-';
+            p[8] = (st.st_mode & S_IWOTH) ? 'w' : '-';
+            p[9] = (st.st_mode & S_IXOTH) ? 'x' : '-';
+            p[10] = '\0';
+            perms = [NSString stringWithUTF8String:p];
+
+            // If symlink, also stat the target to check if it's a dir
+            if (isSymlink) {
+                struct stat tst;
+                if (stat(fullPath, &tst) == 0) {
+                    isDir = S_ISDIR(tst.st_mode);
+                }
+            }
+        } else {
+            // Couldn't stat — try granting access to the entry itself
+            FDGrantAccess(fullPath);
+            if (lstat(fullPath, &st) == 0) {
+                isDir = S_ISDIR(st.st_mode);
+                size = (uint64_t)st.st_size;
+                modTime = (double)st.st_mtimespec.tv_sec;
+            }
+            // Still include it even without stat — the name alone is valuable
+            if (entry->d_type == DT_DIR) isDir = YES;
+        }
+
+        NSString *fullPathStr = [NSString stringWithUTF8String:fullPath];
+        [results addObject:@{
+            @"name": name,
+            @"path": fullPathStr ?: name,
+            @"isDir": @(isDir),
+            @"size": @(size),
+            @"modified": @(modTime),
+            @"perms": perms,
+            @"isHidden": @(isHidden),
+            @"isSymlink": @(isSymlink),
+        }];
+    }
+    closedir(dp);
+
+    NSLog(@"[FD] FDListDirectoryRaw(%s): %lu entries (incl hidden)", dirPath, (unsigned long)results.count);
+    return results;
+}

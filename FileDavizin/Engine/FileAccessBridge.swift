@@ -44,12 +44,25 @@ enum FileAccessBridge {
     }
 
     static func listDirectory(at path: String) -> [FileNode] {
-        let fm = FileManager.default
-        if let entries = try? fm.contentsOfDirectory(atPath: path) {
-            return entries.compactMap { name in
-                fileNode(name: name, parentPath: path)
+        let rawResults = FDListDirectoryRaw(path)
+        if !rawResults.isEmpty {
+            return rawResults.compactMap { dict -> FileNode? in
+                guard let name = dict["name"] as? String,
+                      let fullPath = dict["path"] as? String else { return nil }
+                let isDir = (dict["isDir"] as? NSNumber)?.boolValue ?? false
+                let size = (dict["size"] as? NSNumber)?.uint64Value ?? 0
+                let modInterval = (dict["modified"] as? NSNumber)?.doubleValue ?? 0
+                let modDate = modInterval > 0 ? Date(timeIntervalSince1970: modInterval) : nil
+                let isHidden = (dict["isHidden"] as? NSNumber)?.boolValue ?? false
+                let isSymlink = (dict["isSymlink"] as? NSNumber)?.boolValue ?? false
+                let perms = dict["perms"] as? String
+                return FileNode(name: name, path: fullPath, isDirectory: isDir,
+                                size: size, modifiedDate: modDate,
+                                isHidden: isHidden, isSymlink: isSymlink, permissions: perms)
             }.sorted()
         }
+
+        let fm = FileManager.default
         let _ = grantAccess(path: path)
         if let entries = try? fm.contentsOfDirectory(atPath: path) {
             return entries.compactMap { name in
