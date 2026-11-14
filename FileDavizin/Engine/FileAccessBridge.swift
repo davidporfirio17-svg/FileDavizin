@@ -38,6 +38,23 @@ enum FileAccessBridge {
         return raw.map { AppContainer(identifier: $0.identifier, path: $0.path) }
     }
 
+    static func resolveBundlePath(bundleID: String) -> String? {
+        var result: String?
+        FDTryObjC({
+            result = FDResolveBundlePath(bundleID)
+        }, nil)
+        return result
+    }
+
+    static func extractAppIcon(bundleID: String) -> UIImage? {
+        var data: NSData?
+        FDTryObjC({
+            data = FDExtractAppIcon(bundleID) as NSData?
+        }, nil)
+        guard let d = data as Data? else { return nil }
+        return UIImage(data: d)
+    }
+
     static func deleteItem(at path: String) -> Bool {
         deleteFile(at: path)
     }

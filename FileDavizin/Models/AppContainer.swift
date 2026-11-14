@@ -1,9 +1,11 @@
-import Foundation
+import UIKit
 
 struct AppContainer: Hashable {
     let identifier: String
     let path: String
+    var bundlePath: String?
     var cachedSize: String = ""
+    var iconImage: UIImage?
 
     var displayName: String {
         let parts = identifier.split(separator: ".")

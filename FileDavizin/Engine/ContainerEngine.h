@@ -41,4 +41,12 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath);
 /// Returns array of dicts: path, label, accessible (bool), entryCount (int).
 NSArray<NSDictionary *> *FDProbeAccessiblePaths(void);
 
+/// Resolve the bundle container path for a given bundle ID.
+/// Returns the path to the Bundle/Application/<UUID> directory, or nil.
+NSString * _Nullable FDResolveBundlePath(NSString *bundleID);
+
+/// Extract the app icon from a bundle container.
+/// Returns PNG data or nil if not found.
+NSData * _Nullable FDExtractAppIcon(NSString *bundleID);
+
 NS_ASSUME_NONNULL_END

@@ -1378,6 +1378,7 @@ static NSString *_mcmQuerySystemContainerPath(uint64_t cls, NSString *identifier
 
 static NSMutableSet *sCSStoreContainerPaths = nil;
 static NSMutableDictionary *sCSStorePathToBundle = nil;
+static NSMutableDictionary *sCSStoreBIDToBundlePath = nil;
 
 static NSSet<NSString *> *_findAndParseCSStores(void) {
     NSMutableSet *allCandidates = [NSMutableSet set];
@@ -1539,9 +1540,21 @@ static NSSet<NSString *> *_findAndParseCSStores(void) {
         }
     }
 
-    NSLog(@"[FD-CS] SUMMARY: dirs_accessible=%d stores=%d total_candidates=%lu cross_refs=%lu",
+    // Build reverse mapping: bundleID → bundle container path
+    if (!sCSStoreBIDToBundlePath)
+        sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+    for (NSString *path in sCSStorePathToBundle) {
+        if ([path rangeOfString:@"/Bundle/Application/"].location != NSNotFound) {
+            NSString *bid = [sCSStorePathToBundle objectForKey:path];
+            if (bid && ![sCSStoreBIDToBundlePath objectForKey:bid])
+                [sCSStoreBIDToBundlePath setObject:path forKey:bid];
+        }
+    }
+
+    NSLog(@"[FD-CS] SUMMARY: dirs_accessible=%d stores=%d total_candidates=%lu cross_refs=%lu bundle_paths=%lu",
           dirsAccessible, storesFound, (unsigned long)allCandidates.count,
-          (unsigned long)sCSStorePathToBundle.count);
+          (unsigned long)sCSStorePathToBundle.count,
+          (unsigned long)sCSStoreBIDToBundlePath.count);
     return allCandidates;
 }
 
@@ -1976,6 +1989,182 @@ NSString *FDDiscoverContainerPath(NSString *bundleID) {
     }
 
     FDLog([NSString stringWithFormat:@"Container not found for %@", bundleID]);
+    return nil;
+}
+
+#pragma mark - FDResolveBundlePath
+
+NSString *FDResolveBundlePath(NSString *bundleID) {
+    if (!bundleID.length) return nil;
+
+    _ensureEngineMutex();
+    pthread_mutex_lock(&sEngineMutex);
+
+    // Method 1: csstore reverse mapping (fastest)
+    if (sCSStoreBIDToBundlePath) {
+        NSString *path = [sCSStoreBIDToBundlePath objectForKey:bundleID];
+        if (path) {
+            pthread_mutex_unlock(&sEngineMutex);
+            return path;
+        }
+    }
+
+    // Method 2: LSApplicationProxy
+    Class LSProxy = NSClassFromString(@"LSApplicationProxy");
+    if (LSProxy) {
+        @try {
+            SEL sel = @selector(applicationProxyForIdentifier:);
+            if ([LSProxy respondsToSelector:sel]) {
+                id proxy = [LSProxy performSelector:sel withObject:bundleID];
+                if (proxy) {
+                    NSURL *bundleURL = nil;
+                    if ([proxy respondsToSelector:@selector(bundleContainerURL)])
+                        bundleURL = [proxy performSelector:@selector(bundleContainerURL)];
+                    if (!bundleURL && [proxy respondsToSelector:@selector(bundleURL)]) {
+                        bundleURL = [proxy performSelector:@selector(bundleURL)];
+                        if (bundleURL)
+                            bundleURL = [bundleURL URLByDeletingLastPathComponent];
+                    }
+                    if (bundleURL) {
+                        NSString *path = bundleURL.path;
+                        if ([path hasPrefix:@"/var/"])
+                            path = [@"/private" stringByAppendingString:path];
+                        if (path.length > 0) {
+                            // Cache it
+                            if (!sCSStoreBIDToBundlePath)
+                                sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+                            [sCSStoreBIDToBundlePath setObject:path forKey:bundleID];
+                            pthread_mutex_unlock(&sEngineMutex);
+                            return path;
+                        }
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[FD] LSProxy bundle exception for %@: %@", bundleID, e);
+        }
+    }
+
+    // Method 3: MCM class-2 with part=1 (bundle container)
+    MCMAPI *api = FDGetAPI();
+    if (api->queryCreate && api->querySetIdentifiers && api->queryGetSingle && api->objectGetPath) {
+        static const uint64_t kFlags[] = { 0x900000000ULL, 0x8100000000ULL, 0x100000000ULL };
+        for (int f = 0; f < 3; f++) {
+            void *q = api->queryCreate();
+            if (!q) continue;
+            api->querySetClass(q, 2);
+            xpc_object_t xid = xpc_string_create(bundleID.UTF8String);
+            api->querySetIdentifiers(q, xid);
+            api->querySetFlags(q, kFlags[f]);
+            if (api->querySetPart) api->querySetPart(q, 1);
+            void *res = api->queryGetSingle(q);
+            NSString *path = nil;
+            if (res) {
+                const char *raw = api->objectGetPath(res);
+                if (raw) {
+                    path = [NSString stringWithUTF8String:raw];
+                    if (path && ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"]))
+                        path = [@"/private" stringByAppendingString:path];
+                }
+            }
+            xpc_release(xid);
+            api->queryFree(q);
+            if (path.length > 0 && path.isAbsolutePath) {
+                if (!sCSStoreBIDToBundlePath)
+                    sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+                [sCSStoreBIDToBundlePath setObject:path forKey:bundleID];
+                pthread_mutex_unlock(&sEngineMutex);
+                return path;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&sEngineMutex);
+    return nil;
+}
+
+#pragma mark - FDExtractAppIcon
+
+NSData *FDExtractAppIcon(NSString *bundleID) {
+    if (!bundleID.length) return nil;
+
+    NSString *bundlePath = FDResolveBundlePath(bundleID);
+    if (!bundlePath) return nil;
+
+    // Grant access to bundle container
+    FDGrantAccess(bundlePath.UTF8String);
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Find .app directory inside bundle container
+    NSArray *contents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
+    NSString *appDir = nil;
+    for (NSString *name in contents) {
+        if ([name hasSuffix:@".app"]) {
+            appDir = [bundlePath stringByAppendingPathComponent:name];
+            break;
+        }
+    }
+    if (!appDir) return nil;
+
+    // Grant access to .app directory
+    FDGrantAccess(appDir.UTF8String);
+
+    // Read Info.plist
+    NSString *infoPlist = [appDir stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlist];
+
+    // Collect icon names from Info.plist
+    NSMutableArray *iconNames = [NSMutableArray array];
+    if (info) {
+        NSDictionary *icons = info[@"CFBundleIcons"];
+        if (icons) {
+            NSDictionary *primary = icons[@"CFBundlePrimaryIcon"];
+            if (primary) {
+                NSArray *files = primary[@"CFBundleIconFiles"];
+                if (files) [iconNames addObjectsFromArray:files];
+            }
+        }
+        NSDictionary *iconsPad = info[@"CFBundleIcons~ipad"];
+        if (iconsPad) {
+            NSDictionary *primary = iconsPad[@"CFBundlePrimaryIcon"];
+            if (primary) {
+                NSArray *files = primary[@"CFBundleIconFiles"];
+                if (files) [iconNames addObjectsFromArray:files];
+            }
+        }
+        NSArray *legacy = info[@"CFBundleIconFiles"];
+        if (legacy) [iconNames addObjectsFromArray:legacy];
+        NSString *singleIcon = info[@"CFBundleIconFile"];
+        if (singleIcon) [iconNames addObject:singleIcon];
+    }
+
+    // Try each icon name with various suffixes
+    NSArray *suffixes = @[@"@3x.png", @"@2x.png", @".png", @"@3x", @"@2x", @""];
+    for (NSString *name in iconNames) {
+        for (NSString *suffix in suffixes) {
+            NSString *iconPath = [appDir stringByAppendingPathComponent:
+                [name stringByAppendingString:suffix]];
+            NSData *data = [NSData dataWithContentsOfFile:iconPath];
+            if (data.length > 100) return data;
+        }
+    }
+
+    // Fallback: common icon filenames
+    NSArray *fallbacks = @[
+        @"AppIcon60x60@3x.png", @"AppIcon60x60@2x.png",
+        @"AppIcon76x76@2x.png", @"AppIcon40x40@3x.png",
+        @"AppIcon@3x.png", @"AppIcon@2x.png",
+        @"Icon-60@3x.png", @"Icon-60@2x.png",
+        @"Icon@2x.png", @"Icon.png",
+        @"iTunesArtwork",
+    ];
+    for (NSString *name in fallbacks) {
+        NSString *iconPath = [appDir stringByAppendingPathComponent:name];
+        NSData *data = [NSData dataWithContentsOfFile:iconPath];
+        if (data.length > 100) return data;
+    }
+
     return nil;
 }
 
