@@ -10,7 +10,11 @@ enum FileAccessBridge {
     }
 
     static func grantAccess(path: String) -> Int64 {
-        FDGrantAccess(path)
+        var result: Int64 = -1
+        FDTryObjC({
+            result = FDGrantAccess(path)
+        }, nil)
+        return result
     }
 
     static func releaseAccess(handle: Int64) {
@@ -27,7 +31,10 @@ enum FileAccessBridge {
     }
 
     static func discoverAllContainers() -> [AppContainer] {
-        let raw = enumerateInstalledApps()
+        var raw: [(identifier: String, path: String)] = []
+        FDTryObjC({
+            raw = enumerateInstalledApps()
+        }, nil)
         return raw.map { AppContainer(identifier: $0.identifier, path: $0.path) }
     }
 
@@ -44,7 +51,16 @@ enum FileAccessBridge {
     }
 
     static func listDirectory(at path: String) -> [FileNode] {
-        let rawResults = FDListDirectoryRaw(path)
+        var rawResults: [NSDictionary] = []
+        var exc: NSException?
+        let ok = FDTryObjC({
+            rawResults = FDListDirectoryRaw(path) as [NSDictionary]
+        }, &exc)
+
+        if !ok {
+            NSLog("[FD] listDirectory exception for %@: %@", path, exc?.reason ?? "unknown")
+        }
+
         if !rawResults.isEmpty {
             return rawResults.compactMap { dict -> FileNode? in
                 guard let name = dict["name"] as? String,

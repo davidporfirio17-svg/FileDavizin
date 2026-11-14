@@ -136,7 +136,18 @@ static void _storeLease(MCMAPI *api, void *q, void *act, const char *ident, cons
 static char sDiag[8192] = "";
 static int  sDiagLen = 0;
 static pthread_mutex_t sDiagMutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t sWQSymMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t sEngineMutex;
+static dispatch_once_t sEngineMutexOnce;
+static void _ensureEngineMutex(void) {
+    dispatch_once(&sEngineMutexOnce, ^{
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&sEngineMutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+    });
+}
 
 static void _diagReset(void) {
     pthread_mutex_lock(&sDiagMutex);
@@ -255,7 +266,8 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                                                              "sandbox_extension_consume");
     if (!consumeExt) return -2;
 
-    pthread_mutex_lock(&sWQSymMutex);
+    _ensureEngineMutex();
+    pthread_mutex_lock(&sEngineMutex);
     @autoreleasepool {
 
         static const uint64_t kFlagSets[] = {
@@ -368,7 +380,7 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                         FDLog([NSString stringWithFormat:
                             @"WQ-SYM success g[%d] f=%d → %s", g, fi, targetPath]);
                         close(libraryFd);
-                        pthread_mutex_unlock(&sWQSymMutex);
+                        pthread_mutex_unlock(&sEngineMutex);
                         return handle;
                     }
                     NSLog(@"[FD-SYM] g[%d] f=%d handle=%lld but open errno=%d %s",
@@ -380,7 +392,7 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
             close(libraryFd);
         }
 
-        pthread_mutex_unlock(&sWQSymMutex);
+        pthread_mutex_unlock(&sEngineMutex);
         return -1;
     }
 }
@@ -411,18 +423,25 @@ static const FDAnchor kAnchors[] = {
 static const int kAnchorCount = sizeof(kAnchors) / sizeof(kAnchors[0]);
 
 static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) {
+    _ensureEngineMutex();
+    pthread_mutex_lock(&sEngineMutex);
+
     MCMAPI *api = FDGetAPI();
     if (!api->queryCreate || !api->querySetPartDomain || !api->queryGetSingle ||
-        !api->objectCopy || !api->objectActivate)
+        !api->objectCopy || !api->objectActivate) {
+        pthread_mutex_unlock(&sEngineMutex);
         return -1;
+    }
 
     const char *relPath = NULL;
     if (strncmp(targetPath, "/private/var/", 13) == 0)
         relPath = targetPath + 13;
     else if (strncmp(targetPath, "/var/", 5) == 0)
         relPath = targetPath + 5;
-    else
+    else {
+        pthread_mutex_unlock(&sEngineMutex);
         return -1;
+    }
 
     for (int i = 0; i < kAnchorCount; i++) {
         const FDAnchor *a = &kAnchors[i];
@@ -471,6 +490,7 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
                                 _storeLease(api, q, act, leaseLabel ?: a->identifier, targetPath);
                                 free(token);
                                 xpc_release(xid);
+                                pthread_mutex_unlock(&sEngineMutex);
                                 return 9100 + i;
                             }
                         }
@@ -489,6 +509,7 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
                         a->label, hasToken, activated, targetPath]);
                     _storeLease(api, q, act, leaseLabel ?: a->identifier, targetPath);
                     xpc_release(xid);
+                    pthread_mutex_unlock(&sEngineMutex);
                     return 9100 + i;
                 }
                 if (api->objectFree) api->objectFree(act);
@@ -499,6 +520,7 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
         api->queryFree(q);
     }
 
+    pthread_mutex_unlock(&sEngineMutex);
     return -1;
 }
 
@@ -724,9 +746,7 @@ typedef char *(*SandboxIssueFilePidFunc)(const char *, const char *, uint32_t, p
 typedef int   (*SandboxCheckFunc)(pid_t, const char *, int, ...);
 #define SANDBOX_FILTER_PATH 1
 
-int64_t FDGrantAccess(const char *path) {
-    if (!path || path[0] != '/') return -1;
-
+static int64_t _FDGrantAccessLocked(const char *path) {
     _diagReset();
     _diagAppend("grant target=%s | ", path);
 
@@ -1030,6 +1050,15 @@ int64_t FDGrantAccess(const char *path) {
     _diagAppend("ALL FAILED");
     FDLog([NSString stringWithFormat:@"Grant FAILED for %s", pathC]);
     return -1;
+}
+
+int64_t FDGrantAccess(const char *path) {
+    if (!path || path[0] != '/') return -1;
+    _ensureEngineMutex();
+    pthread_mutex_lock(&sEngineMutex);
+    int64_t result = _FDGrantAccessLocked(path);
+    pthread_mutex_unlock(&sEngineMutex);
+    return result;
 }
 
 void FDReleaseAccess(int64_t handle) {
@@ -2352,6 +2381,9 @@ NSString *FDRunFullDiagnostic(void) {
 NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
     if (!dirPath) return @[];
 
+    _ensureEngineMutex();
+    pthread_mutex_lock(&sEngineMutex);
+
     // Try opening directly first (works if we have root/sandbox escape)
     DIR *dp = opendir(dirPath);
 
@@ -2376,6 +2408,7 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
 
     if (!dp) {
         NSLog(@"[FD] FDListDirectoryRaw: opendir(%s) failed: %s", dirPath, strerror(errno));
+        pthread_mutex_unlock(&sEngineMutex);
         return @[];
     }
 
@@ -2446,10 +2479,14 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
     closedir(dp);
 
     NSLog(@"[FD] FDListDirectoryRaw(%s): %lu entries (incl hidden)", dirPath, (unsigned long)results.count);
+    pthread_mutex_unlock(&sEngineMutex);
     return results;
 }
 
 NSArray<NSDictionary *> *FDProbeAccessiblePaths(void) {
+    _ensureEngineMutex();
+    pthread_mutex_lock(&sEngineMutex);
+
     static const struct { const char *path; const char *label; } kPaths[] = {
         { "/",                                              "/ (raiz)" },
         { "/System",                                        "/System" },
@@ -2563,5 +2600,6 @@ NSArray<NSDictionary *> *FDProbeAccessiblePaths(void) {
         if ([d[@"accessible"] boolValue]) totalAccessible++;
     }
     NSLog(@"[FD] FDProbeAccessiblePaths: %d/%lu accessible", totalAccessible, (unsigned long)results.count);
+    pthread_mutex_unlock(&sEngineMutex);
     return results;
 }

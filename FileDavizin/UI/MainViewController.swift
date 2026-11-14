@@ -22,6 +22,21 @@ final class MainViewController: UIViewController {
     private var currentChild: UIViewController?
     private var selectedIndex = 0
     private var statusObserver: NSObjectProtocol?
+    private lazy var navControllers: [UINavigationController] = {
+        [appsVC, systemVC, patchesVC, settingsVC].map { vc in
+            let nav = UINavigationController(rootViewController: vc)
+            nav.navigationBar.prefersLargeTitles = false
+            nav.navigationBar.barTintColor = FDTheme.background
+            nav.navigationBar.tintColor = FDTheme.accent
+            let appearance = UINavigationBarAppearance()
+            appearance.configureWithOpaqueBackground()
+            appearance.backgroundColor = FDTheme.background
+            appearance.titleTextAttributes = [.foregroundColor: FDTheme.primaryText]
+            nav.navigationBar.standardAppearance = appearance
+            nav.navigationBar.scrollEdgeAppearance = appearance
+            return nav
+        }
+    }()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -208,18 +223,9 @@ final class MainViewController: UIViewController {
     private func selectTab(_ index: Int, animated: Bool) {
         selectedIndex = index
 
-        let controllers: [UIViewController] = [appsVC, systemVC, patchesVC, settingsVC]
-        let target = controllers[index]
-        let targetNav = UINavigationController(rootViewController: target)
-        targetNav.navigationBar.prefersLargeTitles = false
-        targetNav.navigationBar.barTintColor = FDTheme.background
-        targetNav.navigationBar.tintColor = FDTheme.accent
-        let appearance = UINavigationBarAppearance()
-        appearance.configureWithOpaqueBackground()
-        appearance.backgroundColor = FDTheme.background
-        appearance.titleTextAttributes = [.foregroundColor: FDTheme.primaryText]
-        targetNav.navigationBar.standardAppearance = appearance
-        targetNav.navigationBar.scrollEdgeAppearance = appearance
+        let targetNav = navControllers[index]
+
+        guard targetNav !== currentChild else { return }
 
         if let old = currentChild {
             old.willMove(toParent: nil)
