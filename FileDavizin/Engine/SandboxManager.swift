@@ -62,16 +62,38 @@ final class SandboxManager {
         NSLog("[FD] Engine init result: accessible=%d sandbox_active=%d",
               accessible, active)
 
-        // Step 2: Always try kexploit for full jailbreak-like access
+        // Step 2: Post partial status so app is usable while kexploit runs
+        if accessible > 0 || active != 0 {
+            lock.lock()
+            status = .ready(method: active != 0 ? "WQ-SYM" : "WQ-SYM (parcial \(accessible))")
+            lock.unlock()
+            postStatus()
+        }
+
+        // Step 3: Try kexploit in background with timeout
         let supportsKernel = FDSupportPolicy.isSupported(
             major: ver.major, minor: ver.minor, patch: ver.patch
         )
 
         if supportsKernel {
-            NSLog("[FD] Kernel offsets available, running kexploit_opa334...")
-            let exploitResult = kexploit_opa334()
+            NSLog("[FD] Kernel offsets available, running kexploit_opa334 (timeout 30s)...")
 
-            if exploitResult == 0 {
+            var exploitResult: Int32 = -999
+            let sem = DispatchSemaphore(value: 0)
+
+            let exploitThread = Thread {
+                exploitResult = kexploit_opa334()
+                sem.signal()
+            }
+            exploitThread.qualityOfService = .userInitiated
+            exploitThread.start()
+
+            let timeout = sem.wait(timeout: .now() + 30)
+
+            if timeout == .timedOut {
+                NSLog("[FD] kexploit TIMEOUT after 30s — OOB primitive likely patched on iOS %d.%d", ver.major, ver.minor)
+                kexploit_request_stop(99)
+            } else if exploitResult == 0 {
                 NSLog("[FD] kexploit OK, running sandbox_escape...")
                 let selfProc = proc_self()
 
@@ -85,16 +107,13 @@ final class SandboxManager {
                 NSLog("[FD] sandbox_elevate_to_root result: %d", rootResult)
 
                 let activeAfterEscape = sandbox_access_is_active() != 0
-                NSLog("[FD] sandbox_active after full escape: %d", activeAfterEscape ? 1 : 0)
+                NSLog("[FD] sandbox_active after full escape: %d uid=%d", activeAfterEscape ? 1 : 0, getuid())
 
-                if activeAfterEscape {
+                if activeAfterEscape || escapeResult == 0 || rootResult == 0 {
                     hasFullEscape = true
-                    return .ready(method: "kexploit + root")
-                }
-
-                if escapeResult == 0 || rootResult == 0 {
-                    hasFullEscape = true
-                    return .ready(method: "kexploit (parcial)")
+                    let uid = getuid()
+                    let method = uid == 0 ? "kexploit + root (uid=0)" : "kexploit + sandbox_escape"
+                    return .ready(method: method)
                 }
             } else {
                 NSLog("[FD] kexploit failed: KXP-%d", abs(exploitResult))
@@ -103,7 +122,7 @@ final class SandboxManager {
             NSLog("[FD] No kernel offsets for iOS %d.%d", ver.major, ver.minor)
         }
 
-        // Step 3: Fallback to WQ-SYM access
+        // Step 4: Return WQ-SYM status
         if active != 0 {
             return .ready(method: "WQ-SYM")
         }
