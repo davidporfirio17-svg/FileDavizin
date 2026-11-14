@@ -9,6 +9,7 @@ final class AppsViewController: UIViewController {
     private let spinner = UIActivityIndicatorView(style: .medium)
     private var isScanning = false
     private var statusObserver: NSObjectProtocol?
+    private var searchDebounce: DispatchWorkItem?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -118,7 +119,11 @@ final class AppsViewController: UIViewController {
         spinner.startAnimating()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let containers = FileAccessBridge.discoverAllContainers()
+            var containers = FileAccessBridge.discoverAllContainers()
+            // Pre-compute sizes in background so cells don't do IPC
+            for i in containers.indices {
+                containers[i].computeSize()
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.allContainers = containers.sorted { $0.identifier < $1.identifier }
@@ -182,10 +187,15 @@ extension AppsViewController: UICollectionViewDelegate {
 
 extension AppsViewController: UISearchBarDelegate {
     func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-        applyFilter()
+        searchDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.applyFilter() }
+        searchDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
+        searchDebounce?.cancel()
+        applyFilter()
         searchBar.resignFirstResponder()
     }
 }

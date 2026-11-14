@@ -66,7 +66,7 @@ final class AppCell: UICollectionViewCell {
 
     func configure(with container: AppContainer) {
         bundleLabel.text = container.displayName + " — " + container.identifier
-        pathLabel.text = container.containerSize
+        pathLabel.text = container.cachedSize.isEmpty ? container.shortPath : container.cachedSize
         iconLabel.text = container.iconLetter
 
         let hue = CGFloat(abs(container.identifier.hashValue) % 360) / 360.0

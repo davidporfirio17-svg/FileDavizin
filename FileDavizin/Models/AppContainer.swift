@@ -3,6 +3,7 @@ import Foundation
 struct AppContainer: Hashable {
     let identifier: String
     let path: String
+    var cachedSize: String = ""
 
     var displayName: String {
         let parts = identifier.split(separator: ".")
@@ -24,15 +25,27 @@ struct AppContainer: Hashable {
         String(displayName.prefix(1)).uppercased()
     }
 
-    var containerSize: String {
+    var shortPath: String {
+        let comps = (path as NSString).pathComponents
+        if comps.count > 3 {
+            return ".../" + comps.suffix(2).joined(separator: "/")
+        }
+        return path
+    }
+
+    mutating func computeSize() {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: path) else { return "N/A" }
+        guard fm.fileExists(atPath: path) else { cachedSize = "N/A"; return }
         if let contents = try? fm.contentsOfDirectory(atPath: path) {
-            return "\(contents.count) items"
+            cachedSize = "\(contents.count) items"
+            return
         }
         let _ = FDGrantAccess(path)
-        guard let contents = try? fm.contentsOfDirectory(atPath: path) else { return "---" }
-        return "\(contents.count) items"
+        if let contents = try? fm.contentsOfDirectory(atPath: path) {
+            cachedSize = "\(contents.count) items"
+        } else {
+            cachedSize = "---"
+        }
     }
 
     var metadataIdentifier: String? {
