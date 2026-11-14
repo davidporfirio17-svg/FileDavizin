@@ -11,6 +11,7 @@
 #import <dirent.h>
 #import <sys/stat.h>
 #import <errno.h>
+#import <pthread.h>
 
 #pragma mark - containermanager C API types
 
@@ -132,12 +133,19 @@ static void _storeLease(MCMAPI *api, void *q, void *act, const char *ident, cons
 
 #pragma mark - Logging / diagnostics
 
-static _Thread_local char sDiag[8192] = "";
-static _Thread_local int  sDiagLen = 0;
+static char sDiag[8192] = "";
+static int  sDiagLen = 0;
+static pthread_mutex_t sDiagMutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void _diagReset(void) { sDiag[0] = '\0'; sDiagLen = 0; }
+static void _diagReset(void) {
+    pthread_mutex_lock(&sDiagMutex);
+    sDiag[0] = '\0';
+    sDiagLen = 0;
+    pthread_mutex_unlock(&sDiagMutex);
+}
 static void _diagAppend(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void _diagAppend(const char *fmt, ...) {
+    pthread_mutex_lock(&sDiagMutex);
     va_list ap;
     va_start(ap, fmt);
     int remaining = (int)sizeof(sDiag) - sDiagLen - 1;
@@ -146,6 +154,7 @@ static void _diagAppend(const char *fmt, ...) {
         if (n > 0) sDiagLen += (n < remaining ? n : remaining);
     }
     va_end(ap);
+    pthread_mutex_unlock(&sDiagMutex);
 }
 
 static inline void FDLog(NSString *msg) {
@@ -1160,6 +1169,8 @@ static NSDictionary *_extractFromCSStoreBinary(NSData *data) {
     NSUInteger len = data.length;
     NSMutableSet *bundleCandidates = [NSMutableSet set];
     NSMutableSet *containerPaths = [NSMutableSet set];
+    NSMutableArray *bundleEntries = [NSMutableArray array];
+    NSMutableDictionary *pathPositions = [NSMutableDictionary dictionary];
 
     // --- Extract bundle IDs ---
     static const char *prefixes[] = {
@@ -1199,6 +1210,7 @@ static NSDictionary *_extractFromCSStoreBinary(NSData *data) {
                                                   encoding:NSUTF8StringEncoding] autorelease];
             if (s && ![s hasSuffix:@"."] && [s rangeOfString:@".."].location == NSNotFound) {
                 [bundleCandidates addObject:s];
+                [bundleEntries addObject:@{@"b": s, @"p": @(start)}];
             }
         }
     }
@@ -1229,14 +1241,38 @@ static NSDictionary *_extractFromCSStoreBinary(NSData *data) {
                          (int)(ppLen + 36), (const char *)(bytes + j));
             }
             NSString *path = [NSString stringWithUTF8String:pathBuf];
-            if (path) [containerPaths addObject:path];
+            if (path) {
+                [containerPaths addObject:path];
+                if (!pathPositions[path]) pathPositions[path] = @(j);
+            }
             j += ppLen + 35;
+        }
+    }
+
+    NSMutableDictionary *pathToBundle = [NSMutableDictionary dictionary];
+    for (NSString *path in containerPaths) {
+        NSNumber *posNum = pathPositions[path];
+        if (!posNum) continue;
+        NSUInteger pathPos = posNum.unsignedIntegerValue;
+        NSString *nearestBid = nil;
+        NSUInteger nearestDist = NSUIntegerMax;
+        for (NSDictionary *entry in bundleEntries) {
+            NSUInteger bidPos = [entry[@"p"] unsignedIntegerValue];
+            NSUInteger dist = (pathPos > bidPos) ? (pathPos - bidPos) : (bidPos - pathPos);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearestBid = entry[@"b"];
+            }
+        }
+        if (nearestBid && nearestDist < 4096) {
+            pathToBundle[path] = nearestBid;
         }
     }
 
     return @{
         @"bundleIDs": bundleCandidates,
         @"containerPaths": containerPaths,
+        @"pathToBundle": pathToBundle,
     };
 }
 
@@ -1307,11 +1343,14 @@ static NSString *_mcmQuerySystemContainerPath(uint64_t cls, NSString *identifier
 }
 
 static NSMutableSet *sCSStoreContainerPaths = nil;
+static NSMutableDictionary *sCSStorePathToBundle = nil;
 
 static NSSet<NSString *> *_findAndParseCSStores(void) {
     NSMutableSet *allCandidates = [NSMutableSet set];
     if (!sCSStoreContainerPaths)
         sCSStoreContainerPaths = [[NSMutableSet alloc] init];
+    if (!sCSStorePathToBundle)
+        sCSStorePathToBundle = [[NSMutableDictionary alloc] init];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableArray *searchDirs = [NSMutableArray array];
 
@@ -1461,11 +1500,14 @@ static NSSet<NSString *> *_findAndParseCSStores(void) {
                   (unsigned long)ids.count, (unsigned long)paths.count, name);
             [allCandidates unionSet:ids];
             [sCSStoreContainerPaths unionSet:paths];
+            NSDictionary *ptb = extracted[@"pathToBundle"];
+            if (ptb) [sCSStorePathToBundle addEntriesFromDictionary:ptb];
         }
     }
 
-    NSLog(@"[FD-CS] SUMMARY: dirs_accessible=%d stores=%d total_candidates=%lu",
-          dirsAccessible, storesFound, (unsigned long)allCandidates.count);
+    NSLog(@"[FD-CS] SUMMARY: dirs_accessible=%d stores=%d total_candidates=%lu cross_refs=%lu",
+          dirsAccessible, storesFound, (unsigned long)allCandidates.count,
+          (unsigned long)sCSStorePathToBundle.count);
     return allCandidates;
 }
 
@@ -1691,29 +1733,62 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
                (unsigned long)bundleCandidates.count]);
 
         // 2c: Resolve container paths extracted directly from csstore
-        // These are UUID paths embedded in the binary — grant access via WQ-SYM
-        // then read metadata plist to get the bundle ID
+        // WQ-SYM grants directory access; try plist then csstore cross-reference
         int pathResolved = 0;
+        int pathCrossRef = 0;
         NSSet *csPaths = sCSStoreContainerPaths ? [[sCSStoreContainerPaths copy] autorelease] : [NSSet set];
-        FDLog([NSString stringWithFormat:@"csstore-paths: %lu container paths to try",
-               (unsigned long)csPaths.count]);
+        NSDictionary *csPathMap = sCSStorePathToBundle ? [[sCSStorePathToBundle copy] autorelease] : @{};
+        FDLog([NSString stringWithFormat:@"csstore-paths: %lu paths, %lu cross-refs available",
+               (unsigned long)csPaths.count, (unsigned long)csPathMap.count]);
 
         for (NSString *containerPath in csPaths) {
             if (results.count >= limit) break;
             @autoreleasepool {
-                // Only process Data/Application paths (not Bundle paths)
                 if ([containerPath rangeOfString:@"/Data/Application/"].location == NSNotFound)
                     continue;
 
-                // Try WQ-SYM to grant access to this individual container
                 int64_t h = _worseQuerySymlink(containerPath.fileSystemRepresentation);
                 if (h < 0) continue;
 
-                // Read metadata plist to get bundle ID
+                NSString *bid = nil;
+
+                // Method 1: Foundation plist read
                 NSString *metaPath = [containerPath stringByAppendingPathComponent:
                     @".com.apple.mobile_container_manager.metadata.plist"];
                 NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
-                NSString *bid = meta[@"MCMMetadataIdentifier"];
+                bid = meta[@"MCMMetadataIdentifier"];
+
+                // Method 2: Low-level C read + NSPropertyListSerialization
+                if (!bid) {
+                    int fd = open(metaPath.fileSystemRepresentation, O_RDONLY);
+                    if (fd >= 0) {
+                        struct stat st;
+                        if (fstat(fd, &st) == 0 && st.st_size > 0 && st.st_size < 65536) {
+                            void *buf = malloc((size_t)st.st_size);
+                            if (buf) {
+                                ssize_t rd = read(fd, buf, (size_t)st.st_size);
+                                if (rd > 0) {
+                                    NSData *d = [NSData dataWithBytesNoCopy:buf
+                                        length:(NSUInteger)rd freeWhenDone:YES];
+                                    NSDictionary *p = [NSPropertyListSerialization
+                                        propertyListWithData:d
+                                        options:NSPropertyListImmutable
+                                        format:NULL error:nil];
+                                    bid = p[@"MCMMetadataIdentifier"];
+                                } else {
+                                    free(buf);
+                                }
+                            }
+                        }
+                        close(fd);
+                    }
+                }
+
+                // Method 3: csstore binary proximity cross-reference
+                if (!bid) {
+                    bid = csPathMap[containerPath];
+                    if (bid) pathCrossRef++;
+                }
 
                 if (bid.length > 0 && ![seen containsObject:bid]) {
                     pathResolved++;
@@ -1726,8 +1801,8 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
                 }
             }
         }
-        FDLog([NSString stringWithFormat:@"csstore-paths: resolved %d containers via WQ-SYM",
-               pathResolved]);
+        FDLog([NSString stringWithFormat:@"csstore-paths: resolved %d (crossRef=%d)",
+               pathResolved, pathCrossRef]);
 
         // 2d: Batch-resolve remaining candidates via MCM class-2 (with early bailout)
         int resolved = 0;
@@ -1735,7 +1810,7 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
         int attempted = 0;
         for (NSString *bid in bundleCandidates) {
             if (results.count >= limit) break;
-            if (consecutiveFails >= 50) break;
+            if (consecutiveFails >= 500) break;
             @autoreleasepool {
                 attempted++;
                 NSString *path = _mcmResolvePath(bid);
