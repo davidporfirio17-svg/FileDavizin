@@ -1139,11 +1139,29 @@ static NSArray<NSString *> *_enumerateIdentifiers(uint64_t cls, NSUInteger limit
 
 #pragma mark - LaunchServices csstore parsing
 
-static NSSet<NSString *> *_extractBundleIDsFromBinary(NSData *data) {
+static BOOL _isValidUUIDAt(const uint8_t *bytes, NSUInteger pos, NSUInteger len) {
+    // UUID: 8-4-4-4-12 hex with dashes = 36 chars
+    if (pos + 36 > len) return NO;
+    static const int dashPos[] = { 8, 13, 18, 23 };
+    for (int d = 0; d < 4; d++) {
+        if (bytes[pos + dashPos[d]] != '-') return NO;
+    }
+    for (int c = 0; c < 36; c++) {
+        if (c == 8 || c == 13 || c == 18 || c == 23) continue;
+        uint8_t ch = bytes[pos + c];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f')))
+            return NO;
+    }
+    return YES;
+}
+
+static NSDictionary *_extractFromCSStoreBinary(NSData *data) {
     const uint8_t *bytes = (const uint8_t *)data.bytes;
     NSUInteger len = data.length;
-    NSMutableSet *candidates = [NSMutableSet set];
+    NSMutableSet *bundleCandidates = [NSMutableSet set];
+    NSMutableSet *containerPaths = [NSMutableSet set];
 
+    // --- Extract bundle IDs ---
     static const char *prefixes[] = {
         "com.", "org.", "net.", "io.", "app.", "me.", "dev.",
         "co.", "in.", "uk.", "de.", "fr.", "jp.", "kr.",
@@ -1180,11 +1198,46 @@ static NSSet<NSString *> *_extractBundleIDsFromBinary(NSData *data) {
                                                     length:slen
                                                   encoding:NSUTF8StringEncoding] autorelease];
             if (s && ![s hasSuffix:@"."] && [s rangeOfString:@".."].location == NSNotFound) {
-                [candidates addObject:s];
+                [bundleCandidates addObject:s];
             }
         }
     }
-    return candidates;
+
+    // --- Extract container paths with UUIDs ---
+    static const char *pathPrefixes[] = {
+        "/var/mobile/Containers/Data/Application/",
+        "/private/var/mobile/Containers/Data/Application/",
+        "/var/containers/Bundle/Application/",
+        "/private/var/containers/Bundle/Application/",
+    };
+    static const int pathPrefixCount = sizeof(pathPrefixes) / sizeof(pathPrefixes[0]);
+
+    for (int pp = 0; pp < pathPrefixCount; pp++) {
+        size_t ppLen = strlen(pathPrefixes[pp]);
+        const uint8_t *search = (const uint8_t *)pathPrefixes[pp];
+        for (NSUInteger j = 0; j + ppLen + 36 <= len; j++) {
+            if (memcmp(bytes + j, search, ppLen) != 0) continue;
+            NSUInteger uuidStart = j + ppLen;
+            if (!_isValidUUIDAt(bytes, uuidStart, len)) { j += ppLen - 1; continue; }
+
+            char pathBuf[512];
+            if (pp == 0 || pp == 2) {
+                snprintf(pathBuf, sizeof(pathBuf), "/private%.*s",
+                         (int)(ppLen + 36), (const char *)(bytes + j));
+            } else {
+                snprintf(pathBuf, sizeof(pathBuf), "%.*s",
+                         (int)(ppLen + 36), (const char *)(bytes + j));
+            }
+            NSString *path = [NSString stringWithUTF8String:pathBuf];
+            if (path) [containerPaths addObject:path];
+            j += ppLen + 35;
+        }
+    }
+
+    return @{
+        @"bundleIDs": bundleCandidates,
+        @"containerPaths": containerPaths,
+    };
 }
 
 static NSString *_mcmQuerySystemContainerPath(uint64_t cls, NSString *identifier, BOOL group) {
@@ -1253,8 +1306,12 @@ static NSString *_mcmQuerySystemContainerPath(uint64_t cls, NSString *identifier
     return nil;
 }
 
+static NSMutableSet *sCSStoreContainerPaths = nil;
+
 static NSSet<NSString *> *_findAndParseCSStores(void) {
     NSMutableSet *allCandidates = [NSMutableSet set];
+    if (!sCSStoreContainerPaths)
+        sCSStoreContainerPaths = [[NSMutableSet alloc] init];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableArray *searchDirs = [NSMutableArray array];
 
@@ -1397,10 +1454,13 @@ static NSSet<NSString *> *_findAndParseCSStores(void) {
                   name, (unsigned long)data.length, dir);
             if (!data || data.length < 100) continue;
             storesFound++;
-            NSSet *ids = _extractBundleIDsFromBinary(data);
-            NSLog(@"[FD-CS] extracted %lu candidates from %@",
-                  (unsigned long)ids.count, name);
+            NSDictionary *extracted = _extractFromCSStoreBinary(data);
+            NSSet *ids = extracted[@"bundleIDs"];
+            NSSet *paths = extracted[@"containerPaths"];
+            NSLog(@"[FD-CS] extracted %lu candidates + %lu container paths from %@",
+                  (unsigned long)ids.count, (unsigned long)paths.count, name);
             [allCandidates unionSet:ids];
+            [sCSStoreContainerPaths unionSet:paths];
         }
     }
 
@@ -1630,25 +1690,84 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
         FDLog([NSString stringWithFormat:@"LS+csstore: %lu new candidates to resolve",
                (unsigned long)bundleCandidates.count]);
 
-        // 2c: Batch-resolve each candidate via MCM class-2
-        int resolved = 0;
-        for (NSString *bid in bundleCandidates) {
+        // 2c: Resolve container paths extracted directly from csstore
+        // These are UUID paths embedded in the binary — grant access via WQ-SYM
+        // then read metadata plist to get the bundle ID
+        int pathResolved = 0;
+        NSSet *csPaths = sCSStoreContainerPaths ? [[sCSStoreContainerPaths copy] autorelease] : [NSSet set];
+        FDLog([NSString stringWithFormat:@"csstore-paths: %lu container paths to try",
+               (unsigned long)csPaths.count]);
+
+        for (NSString *containerPath in csPaths) {
             if (results.count >= limit) break;
             @autoreleasepool {
+                // Only process Data/Application paths (not Bundle paths)
+                if ([containerPath rangeOfString:@"/Data/Application/"].location == NSNotFound)
+                    continue;
+
+                // Try WQ-SYM to grant access to this individual container
+                int64_t h = _worseQuerySymlink(containerPath.fileSystemRepresentation);
+                if (h < 0) continue;
+
+                // Read metadata plist to get bundle ID
+                NSString *metaPath = [containerPath stringByAppendingPathComponent:
+                    @".com.apple.mobile_container_manager.metadata.plist"];
+                NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+                NSString *bid = meta[@"MCMMetadataIdentifier"];
+
+                if (bid.length > 0 && ![seen containsObject:bid]) {
+                    pathResolved++;
+                    [seen addObject:bid];
+                    [bundleCandidates removeObject:bid];
+                    NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+                    entry[@"identifier"] = bid;
+                    entry[@"path"] = containerPath;
+                    [results addObject:entry];
+                } else if (!bid && h >= 0) {
+                    // Got access but no plist — use UUID as identifier
+                    NSString *uuid = [containerPath lastPathComponent];
+                    if (uuid.length >= 36 && ![seen containsObject:uuid]) {
+                        pathResolved++;
+                        [seen addObject:uuid];
+                        NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+                        entry[@"identifier"] = [NSString stringWithFormat:@"[%@]",
+                            [uuid substringToIndex:8]];
+                        entry[@"path"] = containerPath;
+                        [results addObject:entry];
+                    }
+                }
+            }
+        }
+        FDLog([NSString stringWithFormat:@"csstore-paths: resolved %d containers via WQ-SYM",
+               pathResolved]);
+
+        // 2d: Batch-resolve remaining candidates via MCM class-2 (with early bailout)
+        int resolved = 0;
+        int consecutiveFails = 0;
+        int attempted = 0;
+        for (NSString *bid in bundleCandidates) {
+            if (results.count >= limit) break;
+            if (consecutiveFails >= 50) break;
+            @autoreleasepool {
+                attempted++;
                 NSString *path = _mcmResolvePath(bid);
                 if (path) {
                     resolved++;
+                    consecutiveFails = 0;
                     [seen addObject:bid];
                     NSMutableDictionary *entry = [NSMutableDictionary dictionary];
                     entry[@"identifier"] = bid;
                     entry[@"path"] = path;
                     [results addObject:entry];
+                } else {
+                    consecutiveFails++;
                 }
             }
         }
 
-        FDLog([NSString stringWithFormat:@"MHA-C2 resolved %d/%lu bundle candidates",
-               resolved, (unsigned long)bundleCandidates.count]);
+        FDLog([NSString stringWithFormat:
+            @"MHA-C2 resolved %d/%d attempted (%lu total candidates, bailout@%d consecutive fails)",
+            resolved, attempted, (unsigned long)bundleCandidates.count, consecutiveFails]);
     }
 
     // Pass 3: Directory scan (fallback)
