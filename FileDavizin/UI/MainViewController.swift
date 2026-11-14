@@ -37,6 +37,9 @@ final class MainViewController: UIViewController {
             self?.updateBanner(status)
         }
 
+        setupLogButton()
+        _ = FDLogStore.shared
+
         SandboxManager.shared.prepareAccess()
     }
 
@@ -161,6 +164,42 @@ final class MainViewController: UIViewController {
 
     @objc private func tabTapped(_ sender: UIButton) {
         selectTab(sender.tag, animated: true)
+    }
+
+    private func setupLogButton() {
+        let btn = UIButton(type: .system)
+        let config = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+        btn.setImage(UIImage(systemName: "terminal", withConfiguration: config), for: .normal)
+        btn.tintColor = .white
+        btn.backgroundColor = FDTheme.accent
+        btn.layer.cornerRadius = 22
+        btn.layer.shadowColor = UIColor.black.cgColor
+        btn.layer.shadowOpacity = 0.3
+        btn.layer.shadowOffset = CGSize(width: 0, height: 2)
+        btn.layer.shadowRadius = 4
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        btn.addTarget(self, action: #selector(logButtonTapped), for: .touchUpInside)
+        view.addSubview(btn)
+        NSLayoutConstraint.activate([
+            btn.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            btn.bottomAnchor.constraint(equalTo: bottomBar.topAnchor, constant: -12),
+            btn.widthAnchor.constraint(equalToConstant: 44),
+            btn.heightAnchor.constraint(equalToConstant: 44),
+        ])
+    }
+
+    @objc private func logButtonTapped() {
+        let logVC = LogConsoleViewController()
+        if #available(iOS 16.0, *) {
+            logVC.modalPresentationStyle = .pageSheet
+            if let sheet = logVC.sheetPresentationController {
+                sheet.detents = [.medium(), .large()]
+                sheet.prefersGrabberVisible = true
+            }
+        } else {
+            logVC.modalPresentationStyle = .formSheet
+        }
+        present(logVC, animated: true)
     }
 
     private func selectTab(_ index: Int, animated: Bool) {

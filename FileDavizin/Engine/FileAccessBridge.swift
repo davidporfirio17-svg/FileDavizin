@@ -104,6 +104,36 @@ enum FileAccessBridge {
         }
     }
 
+    static func moveItem(from sourcePath: String, to destPath: String) -> Bool {
+        do {
+            try FileManager.default.moveItem(atPath: sourcePath, toPath: destPath)
+            return true
+        } catch {
+            NSLog("[FD] moveItem error: %@", error.localizedDescription)
+            return false
+        }
+    }
+
+    static func createDirectory(at path: String) -> Bool {
+        do {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true, attributes: nil)
+            return true
+        } catch {
+            NSLog("[FD] createDirectory error: %@", error.localizedDescription)
+            return false
+        }
+    }
+
+    static func writeFile(at path: String, data: Data) -> Bool {
+        do {
+            try data.write(to: URL(fileURLWithPath: path))
+            return true
+        } catch {
+            NSLog("[FD] writeFile error: %@", error.localizedDescription)
+            return false
+        }
+    }
+
     static func shareFile(at path: String, from viewController: UIViewController) {
         let url = URL(fileURLWithPath: path)
         let tempDir = FileManager.default.temporaryDirectory
