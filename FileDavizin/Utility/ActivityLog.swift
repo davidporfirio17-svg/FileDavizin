@@ -7,6 +7,8 @@ final class FDLogStore {
     private let lock = NSLock()
     private var entries: [String] = []
     private let maxEntries = 2000
+    private var stderrPipe: Pipe?
+    private var isFromPipe = false
 
     private init() {
         redirectStderr()
@@ -36,6 +38,20 @@ final class FDLogStore {
         }
     }
 
+    func appendFromPipe(_ line: String) {
+        lock.lock()
+        isFromPipe = true
+        entries.append(line)
+        if entries.count > maxEntries {
+            entries.removeFirst(entries.count - maxEntries)
+        }
+        isFromPipe = false
+        lock.unlock()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.didUpdate, object: nil)
+        }
+    }
+
     func clear() {
         lock.lock()
         entries.removeAll()
@@ -47,13 +63,14 @@ final class FDLogStore {
 
     private func redirectStderr() {
         let pipe = Pipe()
+        self.stderrPipe = pipe
         dup2(pipe.fileHandleForWriting.fileDescriptor, STDERR_FILENO)
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
             let lines = str.components(separatedBy: .newlines).filter { !$0.isEmpty }
             for line in lines {
-                self?.append(line)
+                self?.appendFromPipe(line)
             }
         }
     }
