@@ -132,8 +132,8 @@ static void _storeLease(MCMAPI *api, void *q, void *act, const char *ident, cons
 
 #pragma mark - Logging / diagnostics
 
-static char sDiag[8192] = "";
-static int  sDiagLen = 0;
+static _Thread_local char sDiag[8192] = "";
+static _Thread_local int  sDiagLen = 0;
 
 static void _diagReset(void) { sDiag[0] = '\0'; sDiagLen = 0; }
 static void _diagAppend(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1723,18 +1723,6 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
                     entry[@"identifier"] = bid;
                     entry[@"path"] = containerPath;
                     [results addObject:entry];
-                } else if (!bid && h >= 0) {
-                    // Got access but no plist — use UUID as identifier
-                    NSString *uuid = [containerPath lastPathComponent];
-                    if (uuid.length >= 36 && ![seen containsObject:uuid]) {
-                        pathResolved++;
-                        [seen addObject:uuid];
-                        NSMutableDictionary *entry = [NSMutableDictionary dictionary];
-                        entry[@"identifier"] = [NSString stringWithFormat:@"[%@]",
-                            [uuid substringToIndex:8]];
-                        entry[@"path"] = containerPath;
-                        [results addObject:entry];
-                    }
                 }
             }
         }
