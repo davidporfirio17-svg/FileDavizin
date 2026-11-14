@@ -59,6 +59,8 @@ final class FileBrowserViewController: UIViewController {
         ])
     }
 
+    private var emptyLabelCenter: NSLayoutConstraint!
+
     private func setupEmptyState() {
         emptyLabel.text = "Cargando..."
         emptyLabel.font = FDTheme.captionFont()
@@ -70,9 +72,10 @@ final class FileBrowserViewController: UIViewController {
         spinner.color = FDTheme.accent
         spinner.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(spinner)
+        emptyLabelCenter = emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor)
         NSLayoutConstraint.activate([
             emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            emptyLabelCenter,
             emptyLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
             emptyLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
             spinner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -166,27 +169,64 @@ final class FileBrowserViewController: UIViewController {
 
     // MARK: - Load
 
+    private var showingFallback = false
+
     private func loadContents() {
         emptyLabel.text = "Cargando..."
         spinner.startAnimating()
         emptyLabel.isHidden = false
+        showingFallback = false
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let _ = FileAccessBridge.grantAccess(path: self.rootPath)
             let items = FileAccessBridge.listDirectory(at: self.rootPath)
             let sorted = items.sorted()
-            DispatchQueue.main.async {
-                self.nodes = sorted
-                self.tableView.reloadData()
-                self.spinner.stopAnimating()
-                if sorted.isEmpty {
-                    self.emptyLabel.text = "Carpeta vacia o sin acceso"
-                    self.emptyLabel.isHidden = false
-                } else {
-                    self.emptyLabel.isHidden = true
+
+            if sorted.isEmpty {
+                let probed = FDProbeAccessiblePaths() as? [[String: Any]] ?? []
+                let accessible = probed.filter { ($0["accessible"] as? Bool) == true && ($0["entryCount"] as? Int ?? 0) > 0 }
+                let fallbackNodes = accessible.compactMap { dict -> FileNode? in
+                    guard let path = dict["path"] as? String,
+                          let label = dict["label"] as? String else { return nil }
+                    let count = dict["entryCount"] as? Int ?? 0
+                    return FileNode(name: "\(label)  (\(count))",
+                                    path: path, isDirectory: true,
+                                    size: UInt64(count), modifiedDate: nil)
                 }
-                self.updateCountLabel()
+                DispatchQueue.main.async {
+                    if !fallbackNodes.isEmpty {
+                        self.showingFallback = true
+                        self.nodes = fallbackNodes
+                        self.tableView.reloadData()
+                        self.spinner.stopAnimating()
+                        self.emptyLabelCenter.isActive = false
+                        self.emptyLabelCenter = self.emptyLabel.topAnchor.constraint(
+                            equalTo: self.view.safeAreaLayoutGuide.topAnchor, constant: 16)
+                        self.emptyLabelCenter.isActive = true
+                        self.emptyLabel.text = "Sin acceso a \(self.shortenedPath(self.rootPath))\nRutas accesibles:"
+                        self.emptyLabel.isHidden = false
+                    } else {
+                        self.nodes = []
+                        self.tableView.reloadData()
+                        self.spinner.stopAnimating()
+                        self.emptyLabelCenter.isActive = false
+                        self.emptyLabelCenter = self.emptyLabel.centerYAnchor.constraint(
+                            equalTo: self.view.centerYAnchor)
+                        self.emptyLabelCenter.isActive = true
+                        self.emptyLabel.text = "Sin acceso — sandbox bloqueado\n\(self.rootPath)"
+                        self.emptyLabel.isHidden = false
+                    }
+                    self.updateCountLabel()
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.nodes = sorted
+                    self.tableView.reloadData()
+                    self.spinner.stopAnimating()
+                    self.emptyLabel.isHidden = true
+                    self.updateCountLabel()
+                }
             }
         }
     }

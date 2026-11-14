@@ -1902,3 +1902,120 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
     NSLog(@"[FD] FDListDirectoryRaw(%s): %lu entries (incl hidden)", dirPath, (unsigned long)results.count);
     return results;
 }
+
+NSArray<NSDictionary *> *FDProbeAccessiblePaths(void) {
+    static const struct { const char *path; const char *label; } kPaths[] = {
+        { "/",                                              "/ (raiz)" },
+        { "/System",                                        "/System" },
+        { "/System/Library",                                "/System/Library" },
+        { "/System/Library/Frameworks",                     "Frameworks" },
+        { "/usr",                                           "/usr" },
+        { "/usr/lib",                                       "/usr/lib" },
+        { "/usr/bin",                                       "/usr/bin" },
+        { "/bin",                                           "/bin" },
+        { "/sbin",                                          "/sbin" },
+        { "/Applications",                                  "/Applications" },
+        { "/Library",                                       "/Library" },
+        { "/private/var",                                   "/var" },
+        { "/private/var/mobile",                            "/var/mobile" },
+        { "/private/var/mobile/Library",                    "Mobile Library" },
+        { "/private/var/mobile/Containers",                 "Containers" },
+        { "/private/var/mobile/Containers/Data/Application","App Containers" },
+        { "/private/var/mobile/Containers/Shared/AppGroup", "App Groups" },
+        { "/private/var/mobile/Media",                      "Media" },
+        { "/private/var/root",                              "/var/root" },
+        { "/private/var/db",                                "/var/db" },
+        { "/private/var/logs",                              "/var/logs" },
+        { "/private/var/preferences",                       "Preferences" },
+        { "/private/var/containers",                        "All Containers" },
+        { "/private/var/MobileDevice",                      "MobileDevice" },
+        { "/private/etc",                                   "/etc" },
+        { "/tmp",                                           "/tmp" },
+    };
+    int n = sizeof(kPaths) / sizeof(kPaths[0]);
+    NSMutableArray *results = [NSMutableArray arrayWithCapacity:n];
+
+    // Also add app's own container paths
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *appContainer = docs ? [docs stringByDeletingLastPathComponent] : nil;
+
+    if (appContainer) {
+        DIR *dp = opendir(appContainer.fileSystemRepresentation);
+        int count = 0;
+        if (dp) {
+            struct dirent *e;
+            while ((e = readdir(dp))) {
+                if (e->d_name[0] == '.' && (e->d_name[1] == '\0' ||
+                    (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+                count++;
+            }
+            closedir(dp);
+        }
+        [results addObject:@{
+            @"path": appContainer,
+            @"label": @"App Container (propio)",
+            @"accessible": @(count > 0),
+            @"entryCount": @(count),
+        }];
+    }
+
+    // Add app group container
+    NSFileManager *fm = [NSFileManager defaultManager];
+    const char **rtGroups; int rtGroupCount;
+    _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
+    for (int g = 0; g < rtGroupCount; g++) {
+        NSString *gid = [NSString stringWithUTF8String:rtGroups[g]];
+        NSURL *gURL = [fm containerURLForSecurityApplicationGroupIdentifier:gid];
+        if (!gURL) continue;
+        DIR *dp = opendir(gURL.path.fileSystemRepresentation);
+        int count = 0;
+        if (dp) {
+            struct dirent *e;
+            while ((e = readdir(dp))) {
+                if (e->d_name[0] == '.' && (e->d_name[1] == '\0' ||
+                    (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+                count++;
+            }
+            closedir(dp);
+        }
+        [results addObject:@{
+            @"path": gURL.path,
+            @"label": [NSString stringWithFormat:@"App Group %d", g],
+            @"accessible": @(count > 0),
+            @"entryCount": @(count),
+        }];
+    }
+
+    for (int i = 0; i < n; i++) {
+        // Try opendir first without granting
+        DIR *dp = opendir(kPaths[i].path);
+        if (!dp) {
+            // Try granting access
+            FDGrantAccess(kPaths[i].path);
+            dp = opendir(kPaths[i].path);
+        }
+        int count = 0;
+        if (dp) {
+            struct dirent *e;
+            while ((e = readdir(dp))) {
+                if (e->d_name[0] == '.' && (e->d_name[1] == '\0' ||
+                    (e->d_name[1] == '.' && e->d_name[2] == '\0'))) continue;
+                count++;
+            }
+            closedir(dp);
+        }
+        [results addObject:@{
+            @"path": [NSString stringWithUTF8String:kPaths[i].path],
+            @"label": [NSString stringWithUTF8String:kPaths[i].label],
+            @"accessible": @(dp != NULL),
+            @"entryCount": @(count),
+        }];
+    }
+
+    int totalAccessible = 0;
+    for (NSDictionary *d in results) {
+        if ([d[@"accessible"] boolValue]) totalAccessible++;
+    }
+    NSLog(@"[FD] FDProbeAccessiblePaths: %d/%lu accessible", totalAccessible, (unsigned long)results.count);
+    return results;
+}

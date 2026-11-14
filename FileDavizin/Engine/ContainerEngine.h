@@ -37,4 +37,8 @@ NSString *FDRunFullDiagnostic(void);
 /// Returns array of dicts: name, path, isDir, size, modified, perms, isHidden.
 NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath);
 
+/// Probe common filesystem paths and return those that are actually accessible.
+/// Returns array of dicts: path, label, accessible (bool), entryCount (int).
+NSArray<NSDictionary *> *FDProbeAccessiblePaths(void);
+
 NS_ASSUME_NONNULL_END

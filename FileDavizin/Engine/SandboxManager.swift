@@ -76,7 +76,7 @@ final class SandboxManager {
         )
 
         if supportsKernel {
-            NSLog("[FD] Kernel offsets available, running kexploit_opa334 (timeout 30s)...")
+            NSLog("[FD] Kernel offsets available, running kexploit_opa334 (timeout 15s)...")
 
             var exploitResult: Int32 = -999
             let sem = DispatchSemaphore(value: 0)
@@ -85,13 +85,13 @@ final class SandboxManager {
                 exploitResult = kexploit_opa334()
                 sem.signal()
             }
-            exploitThread.qualityOfService = .userInitiated
+            exploitThread.qualityOfService = .background
             exploitThread.start()
 
-            let timeout = sem.wait(timeout: .now() + 30)
+            let timeout = sem.wait(timeout: .now() + 15)
 
             if timeout == .timedOut {
-                NSLog("[FD] kexploit TIMEOUT after 30s — OOB primitive likely patched on iOS %d.%d", ver.major, ver.minor)
+                NSLog("[FD] kexploit TIMEOUT after 15s — OOB primitive likely patched on iOS %d.%d", ver.major, ver.minor)
                 kexploit_request_stop(99)
             } else if exploitResult == 0 {
                 NSLog("[FD] kexploit OK, running sandbox_escape...")
