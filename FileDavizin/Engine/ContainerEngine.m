@@ -441,7 +441,30 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
             if (act) {
                 char *token = api->objectCopyToken ? api->objectCopyToken(act) : NULL;
                 bool hasToken = token && token[0] != '\0';
+
+                if (hasToken) {
+                    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                                             "sandbox_extension_consume");
+                    if (consumeExt) {
+                        int64_t h = consumeExt(token);
+                        if (h >= 0) {
+                            int fd = open(targetPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                            if (fd >= 0) {
+                                close(fd);
+                                FDLog([NSString stringWithFormat:
+                                    @"WQ %s direct-consume h=%lld → open OK for %s",
+                                    a->label, (long long)h, targetPath]);
+                                _storeLease(api, q, act, leaseLabel ?: a->identifier, targetPath);
+                                free(token);
+                                xpc_release(xid);
+                                return 9100 + i;
+                            }
+                        }
+                    }
+                }
+
                 bool activated = hasToken && api->objectActivate(act, false);
+                if (!activated) activated = api->objectActivate(act, true);
                 free(token);
 
                 int fd = open(targetPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -688,6 +711,57 @@ int64_t FDGrantAccess(const char *path) {
         }
     }
 
+    // Strategy 9: MCM class-2 iterate + direct token consumption
+    {
+        SBXExtConsumeFunc consumeExt2 = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                                   "sandbox_extension_consume");
+        if (consumeExt2 && api->queryCreate && api->queryIterate && api->objectGetPath &&
+            api->objectCopyToken) {
+            static const uint64_t kC2Flags[] = { 0x900000000ULL, 0x8100000000ULL };
+            for (int f = 0; f < 2; f++) {
+                void *q9 = api->queryCreate();
+                if (!q9) continue;
+                api->querySetClass(q9, 2);
+                api->querySetFlags(q9, kC2Flags[f]);
+                if (api->querySetPart) api->querySetPart(q9, 0);
+
+                __block int64_t foundHandle = -1;
+                api->queryIterate(q9, ^bool(void *object) {
+                    if (foundHandle >= 0) return false;
+                    const char *objPath = object ? api->objectGetPath(object) : NULL;
+                    if (!objPath) return true;
+
+                    NSString *oPath = [NSString stringWithUTF8String:objPath];
+                    if ([oPath isEqualToString:@"/var"] || [oPath hasPrefix:@"/var/"])
+                        oPath = [@"/private" stringByAppendingString:oPath];
+
+                    if ([cleanPath hasPrefix:oPath] || [cleanPath isEqualToString:oPath]) {
+                        char *tok = api->objectCopyToken(object);
+                        if (tok && tok[0]) {
+                            int64_t h = consumeExt2(tok);
+                            if (h >= 0) {
+                                int fd = open(pathC, O_RDONLY | O_CLOEXEC);
+                                if (fd >= 0) {
+                                    close(fd);
+                                    foundHandle = h;
+                                }
+                            }
+                        }
+                        free(tok);
+                    }
+                    return foundHandle < 0;
+                });
+
+                api->queryFree(q9);
+                if (foundHandle >= 0) {
+                    _diagAppend("MCM-C2-TOK OK h=%lld", (long long)foundHandle);
+                    return 9200 + f;
+                }
+            }
+            _diagAppend("MCM-C2-TOK fail | ");
+        }
+    }
+
     _diagAppend("ALL FAILED");
     FDLog([NSString stringWithFormat:@"Grant FAILED for %s", pathC]);
     return -1;
@@ -743,13 +817,35 @@ static NSString *_queryContainerPath(uint64_t cls, NSString *identifier,
         if (path && ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"]))
             path = [@"/private" stringByAppendingString:path];
 
-        if (api->objectCopy && api->objectActivate) {
+        if (api->objectCopy) {
             void *act = api->objectCopy(res);
             if (act) {
                 char *token = api->objectCopyToken ? api->objectCopyToken(act) : NULL;
                 bool activated = false;
-                if (token && token[0] != '\0')
+
+                if (token && token[0] != '\0' && path) {
+                    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                                             "sandbox_extension_consume");
+                    if (consumeExt) {
+                        int64_t h = consumeExt(token);
+                        if (h >= 0) {
+                            int fd = open(path.UTF8String, O_RDONLY | O_CLOEXEC);
+                            if (fd >= 0) {
+                                close(fd);
+                                activated = true;
+                                NSLog(@"[FD-MCM] Direct consume OK cls=%llu id=%@ h=%lld",
+                                      cls, identifier, (long long)h);
+                            }
+                        }
+                    }
+                }
+
+                if (!activated && api->objectActivate && token && token[0] != '\0')
                     activated = api->objectActivate(act, false);
+
+                if (!activated && api->objectActivate)
+                    activated = api->objectActivate(act, true);
+
                 free(token);
                 if (activated) {
                     _storeLease(api, q, act, identifier.UTF8String, path.UTF8String ?: "");
@@ -867,12 +963,29 @@ static NSString *_mcmQuerySystemContainerPath(uint64_t cls, NSString *identifier
                 if (path && ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"]))
                     path = [@"/private" stringByAppendingString:path];
             }
-            if (api->objectCopy && api->objectActivate) {
+            if (api->objectCopy) {
                 void *act = api->objectCopy(res);
                 if (act) {
                     char *token = api->objectCopyToken ? api->objectCopyToken(act) : NULL;
-                    if (token && token[0] != '\0')
+                    bool activated = false;
+
+                    if (token && token[0] != '\0' && path) {
+                        SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
+                                                                                 "sandbox_extension_consume");
+                        if (consumeExt) {
+                            int64_t h = consumeExt(token);
+                            if (h >= 0) {
+                                int fd = open(path.UTF8String, O_RDONLY | O_CLOEXEC);
+                                if (fd >= 0) { close(fd); activated = true; }
+                            }
+                        }
+                    }
+
+                    if (!activated && api->objectActivate && token && token[0] != '\0')
                         api->objectActivate(act, false);
+                    if (!activated && api->objectActivate)
+                        api->objectActivate(act, true);
+
                     free(token);
                     if (api->objectFree) api->objectFree(act);
                 }
