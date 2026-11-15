@@ -53,7 +53,7 @@ final class AppDetailViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         if section == 0 { return 1 }
-        return container.bundlePath != nil ? 2 : 1
+        return 2
     }
 
     override func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
@@ -147,10 +147,13 @@ final class AppDetailViewController: UITableViewController {
             cell.imageView?.tintColor = FDTheme.accent
         } else {
             cell.textLabel?.text = "Paquete de la app (.app)"
-            let bp = container.bundlePath ?? ""
-            let comps = (bp as NSString).pathComponents
-            cell.detailTextLabel?.text = comps.count > 3
-                ? ".../" + comps.suffix(2).joined(separator: "/") : bp
+            if let bp = container.bundlePath, !bp.isEmpty {
+                let comps = (bp as NSString).pathComponents
+                cell.detailTextLabel?.text = comps.count > 3
+                    ? ".../" + comps.suffix(2).joined(separator: "/") : bp
+            } else {
+                cell.detailTextLabel?.text = "Toca para buscar..."
+            }
             cell.imageView?.image = UIImage(systemName: "shippingbox.fill")
             cell.imageView?.tintColor = FDTheme.warm
         }
@@ -168,10 +171,33 @@ final class AppDetailViewController: UITableViewController {
             let browser = FileBrowserViewController(
                 path: container.path, title: container.displayName)
             navigationController?.pushViewController(browser, animated: true)
-        } else if let bp = container.bundlePath {
-            let browser = FileBrowserViewController(
-                path: bp, title: "Bundle — \(container.displayName)")
-            navigationController?.pushViewController(browser, animated: true)
+        } else {
+            if let bp = container.bundlePath, !bp.isEmpty {
+                let browser = FileBrowserViewController(
+                    path: bp, title: "Bundle — \(container.displayName)")
+                navigationController?.pushViewController(browser, animated: true)
+            } else {
+                let cell = tableView.cellForRow(at: indexPath)
+                cell?.detailTextLabel?.text = "Resolviendo..."
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    let bp = FileAccessBridge.resolveBundlePath(bundleID: self.container.identifier)
+                    DispatchQueue.main.async {
+                        if let bp, !bp.isEmpty {
+                            self.container.bundlePath = bp
+                            self.tableView.reloadData()
+                            let browser = FileBrowserViewController(
+                                path: bp, title: "Bundle — \(self.container.displayName)")
+                            self.navigationController?.pushViewController(browser, animated: true)
+                        } else {
+                            cell?.detailTextLabel?.text = "No disponible"
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                cell?.detailTextLabel?.text = "Toca para buscar..."
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

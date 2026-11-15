@@ -1261,15 +1261,15 @@ static int64_t _FDGrantAccessSafeLocked(const char *path) {
 
 int64_t FDGrantAccessSafe(const char *path) {
     if (!path || path[0] != '/') return -1;
-    _ensureEngineMutex();
-    pthread_mutex_lock(&sEngineMutex);
+    // NOTE: No outer mutex here — each grant strategy locks its own mutex.
+    // Holding an outer mutex + strategy's inner mutex causes leaked lock counts
+    // when exceptions skip the inner unlock, leading to deadlock → crash.
     int64_t result = -1;
     @try {
         result = _FDGrantAccessSafeLocked(path);
     } @catch (NSException *e) {
         NSLog(@"[FD-Safe] top-level exception: %@", e.reason);
     }
-    pthread_mutex_unlock(&sEngineMutex);
     return result;
 }
 
@@ -2204,10 +2204,9 @@ NSString *FDDiscoverContainerPath(NSString *bundleID) {
 NSString *FDResolveBundlePath(NSString *bundleID) {
     if (!bundleID.length) return nil;
 
+    // Method 1: csstore reverse mapping (fastest, thread-safe read)
     _ensureEngineMutex();
     pthread_mutex_lock(&sEngineMutex);
-
-    // Method 1: csstore reverse mapping (fastest)
     if (sCSStoreBIDToBundlePath) {
         NSString *path = [sCSStoreBIDToBundlePath objectForKey:bundleID];
         if (path) {
@@ -2215,11 +2214,12 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
             return path;
         }
     }
+    pthread_mutex_unlock(&sEngineMutex);
 
-    // Method 2: LSApplicationProxy
-    Class LSProxy = NSClassFromString(@"LSApplicationProxy");
-    if (LSProxy) {
-        @try {
+    // Method 2: LSApplicationProxy (no mutex needed, runtime API)
+    @try {
+        Class LSProxy = NSClassFromString(@"LSApplicationProxy");
+        if (LSProxy) {
             SEL sel = @selector(applicationProxyForIdentifier:);
             if ([LSProxy respondsToSelector:sel]) {
                 id proxy = [LSProxy performSelector:sel withObject:bundleID];
@@ -2237,7 +2237,7 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                         if ([path hasPrefix:@"/var/"])
                             path = [@"/private" stringByAppendingString:path];
                         if (path.length > 0) {
-                            // Cache it
+                            pthread_mutex_lock(&sEngineMutex);
                             if (!sCSStoreBIDToBundlePath)
                                 sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
                             [sCSStoreBIDToBundlePath setObject:path forKey:bundleID];
@@ -2247,12 +2247,12 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                     }
                 }
             }
-        } @catch (NSException *e) {
-            NSLog(@"[FD] LSProxy bundle exception for %@: %@", bundleID, e);
         }
+    } @catch (NSException *e) {
+        NSLog(@"[FD] LSProxy bundle exception for %@: %@", bundleID, e);
     }
 
-    // Method 3: MCM class-2 with part=1 (bundle container)
+    // Method 3: MCM class-2 with part=1 (no outer mutex — MCM has own locking)
     @try {
         MCMAPI *api = FDGetAPI();
         if (api->queryCreate && api->querySetIdentifiers && api->queryGetSingle && api->objectGetPath) {
@@ -2278,6 +2278,7 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                 xpc_release(xid);
                 api->queryFree(q);
                 if (path.length > 0 && path.isAbsolutePath) {
+                    pthread_mutex_lock(&sEngineMutex);
                     if (!sCSStoreBIDToBundlePath)
                         sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
                     [sCSStoreBIDToBundlePath setObject:path forKey:bundleID];
@@ -2290,7 +2291,49 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
         NSLog(@"[FD] MCM bundle query exception for %@: %@", bundleID, e);
     }
 
-    pthread_mutex_unlock(&sEngineMutex);
+    // Method 4: Bulk scan /private/var/containers/Bundle/Application/ (world-readable)
+    @try {
+        static BOOL sBundleScanDone = NO;
+        if (!sBundleScanDone) {
+            sBundleScanDone = YES;
+            static NSString *const kBundleBase = @"/private/var/containers/Bundle/Application";
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSArray *entries = [fm contentsOfDirectoryAtPath:kBundleBase error:nil];
+            NSUInteger found = 0;
+            for (NSString *uuid in entries) {
+                @autoreleasepool {
+                    NSString *uuidDir = [kBundleBase stringByAppendingPathComponent:uuid];
+                    NSArray *appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
+                    for (NSString *entry in appEntries) {
+                        if (![entry hasSuffix:@".app"]) continue;
+                        NSString *plistPath = [[uuidDir stringByAppendingPathComponent:entry]
+                                               stringByAppendingPathComponent:@"Info.plist"];
+                        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+                        NSString *bid = info[@"CFBundleIdentifier"];
+                        if (bid.length > 0) {
+                            pthread_mutex_lock(&sEngineMutex);
+                            if (!sCSStoreBIDToBundlePath)
+                                sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+                            if (![sCSStoreBIDToBundlePath objectForKey:bid]) {
+                                [sCSStoreBIDToBundlePath setObject:uuidDir forKey:bid];
+                                found++;
+                            }
+                            pthread_mutex_unlock(&sEngineMutex);
+                        }
+                    }
+                }
+            }
+            NSLog(@"[FD] Bundle scan found %lu new bundle paths", (unsigned long)found);
+            // Re-check cache after bulk scan
+            pthread_mutex_lock(&sEngineMutex);
+            NSString *cachedPath = [sCSStoreBIDToBundlePath objectForKey:bundleID];
+            pthread_mutex_unlock(&sEngineMutex);
+            if (cachedPath) return cachedPath;
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[FD] Bundle scan exception for %@: %@", bundleID, e);
+    }
+
     return nil;
 }
 
@@ -2817,8 +2860,9 @@ NSString *FDRunFullDiagnostic(void) {
 NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
     if (!dirPath) return @[];
 
-    _ensureEngineMutex();
-    pthread_mutex_lock(&sEngineMutex);
+    // NOTE: No outer mutex here — each grant strategy locks its own mutex.
+    // Holding an outer mutex + strategy's inner mutex causes leaked lock counts
+    // when exceptions skip the inner unlock, leading to deadlock → crash.
 
     @try {
         // Try opening directly first
@@ -2915,7 +2959,6 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
 
         if (!dp) {
             NSLog(@"[FD] FDListDirectoryRaw: opendir(%s) FAILED: %s", dirPath, strerror(errno));
-            pthread_mutex_unlock(&sEngineMutex);
             return @[];
         }
 
@@ -2985,12 +3028,10 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
         closedir(dp);
 
         NSLog(@"[FD] FDListDirectoryRaw(%s): %lu entries", dirPath, (unsigned long)results.count);
-        pthread_mutex_unlock(&sEngineMutex);
         return results;
 
     } @catch (NSException *e) {
         NSLog(@"[FD] FDListDirectoryRaw EXCEPTION for %s: %@", dirPath, e);
-        pthread_mutex_unlock(&sEngineMutex);
         return @[];
     }
 }
