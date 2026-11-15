@@ -97,14 +97,18 @@ typedef struct {
     bool  active;
 } FDLease;
 
-#define MAX_LEASES 16
+#define MAX_LEASES 64
 static FDLease sLeases[MAX_LEASES];
+static uint32_t sLeaseUseCounter = 0;
+static uint32_t sLeaseLastUsed[MAX_LEASES];
 static os_unfair_lock sLeaseLock = OS_UNFAIR_LOCK_INIT;
 
 static FDLease *_findLease(const char *identifier) {
     for (int i = 0; i < MAX_LEASES; i++) {
-        if (sLeases[i].active && strcmp(sLeases[i].identifier, identifier) == 0)
+        if (sLeases[i].active && strcmp(sLeases[i].identifier, identifier) == 0) {
+            sLeaseLastUsed[i] = ++sLeaseUseCounter;
             return &sLeases[i];
+        }
     }
     return NULL;
 }
@@ -113,7 +117,15 @@ static FDLease *_allocLease(void) {
     for (int i = 0; i < MAX_LEASES; i++) {
         if (!sLeases[i].active) return &sLeases[i];
     }
-    return &sLeases[0];
+    int oldest = 0;
+    uint32_t oldestUse = sLeaseLastUsed[0];
+    for (int i = 1; i < MAX_LEASES; i++) {
+        if (sLeaseLastUsed[i] < oldestUse) {
+            oldestUse = sLeaseLastUsed[i];
+            oldest = i;
+        }
+    }
+    return &sLeases[oldest];
 }
 
 static void _storeLease(MCMAPI *api, void *q, void *act, const char *ident, const char *path) {
@@ -128,6 +140,7 @@ static void _storeLease(MCMAPI *api, void *q, void *act, const char *ident, cons
     strlcpy(lease->identifier, ident, sizeof(lease->identifier));
     strlcpy(lease->path, path, sizeof(lease->path));
     lease->active = true;
+    sLeaseLastUsed[lease - sLeases] = ++sLeaseUseCounter;
     os_unfair_lock_unlock(&sLeaseLock);
 }
 
@@ -242,8 +255,10 @@ static void _getRuntimeAppGroups(const char ***outGroups, int *outCount) {
 
         sCount = (int)discovered.count;
         sGroups = (const char **)calloc(sCount + 1, sizeof(char *));
-        for (int i = 0; i < sCount; i++)
-            sGroups[i] = strdup(((NSString *)discovered[i]).UTF8String);
+        for (int i = 0; i < sCount; i++) {
+            const char *utf = ((NSString *)discovered[i]).UTF8String;
+            sGroups[i] = utf ? strdup(utf) : strdup("(null)");
+        }
     });
     *outGroups = sGroups;
     *outCount = sCount;
@@ -254,8 +269,12 @@ static void _getRuntimeAppGroups(const char ***outGroups, int *outCount) {
 typedef int64_t (*SBXExtConsumeFunc)(const char *);
 typedef int (*SBXExtReleaseFunc)(int64_t);
 
+static int sPartOneFailCount = 0;
+#define PART1_FAIL_THRESHOLD 3
+
 static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
     if (!targetPath || targetPath[0] != '/') return -1;
+    if (part == 1 && sPartOneFailCount >= PART1_FAIL_THRESHOLD) return -1;
 
     MCMAPI *api = FDGetAPI();
     if (!api->queryCreate || !api->querySetGroupIdentifiers || !api->querySetFlags) {
@@ -379,6 +398,7 @@ static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
                         close(fd);
                         sKnownGoodFlag[ci] = fi;
                         sKnownGoodGroup[ci] = g;
+                        if (part == 1) sPartOneFailCount = 0;
                         FDLog([NSString stringWithFormat:
                             @"WQ-SYM success g[%d] f=%d p=%d → %s", g, fi, part, targetPath]);
                         close(libraryFd);
@@ -398,6 +418,7 @@ static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
             close(libraryFd);
         }
 
+        if (part == 1) sPartOneFailCount++;
         return -1;
     }
     } @finally {
@@ -490,6 +511,8 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
                     SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
                                                                              "sandbox_extension_consume");
                     if (consumeExt) {
+                        SBXExtReleaseFunc relExt = (SBXExtReleaseFunc)dlsym(RTLD_DEFAULT,
+                                                                             "sandbox_extension_release");
                         int64_t h = consumeExt(token);
                         if (h >= 0) {
                             int fd = open(targetPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -503,6 +526,7 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
                                 xpc_release(xid);
                                 return 9100 + i;
                             }
+                            if (relExt) relExt(h);
                         }
                     }
                 }
@@ -634,7 +658,7 @@ static NSArray *_cachedLSApps(void) {
         id workspace = [LSAppWorkspace performSelector:@selector(defaultWorkspace)];
         if (!workspace) return;
         @try {
-            sApps = [workspace performSelector:@selector(allInstalledApplications)];
+            sApps = [[workspace performSelector:@selector(allInstalledApplications)] retain];
         } @catch (NSException *e) {
             NSLog(@"[FD-LS] allInstalledApplications exception: %@", e);
         }
@@ -720,8 +744,10 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
         __block xpc_object_t reply = NULL;
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         xpc_connection_send_message_with_reply(conn, msg, dispatch_get_global_queue(0, 0),
-            ^(xpc_object_t r) { reply = r; dispatch_semaphore_signal(sem); });
+            ^(xpc_object_t r) { if (r) xpc_retain(r); reply = r; dispatch_semaphore_signal(sem); });
         long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 500000000LL));
+        xpc_release(msg);
+        dispatch_release(sem);
         if (waited != 0) {
             NSLog(@"[FD-XPC] timeout op=%llu", kOps[oi]);
             continue;
@@ -744,9 +770,11 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
                 }
             }
         }
+        if (reply) xpc_release(reply);
     }
 
     xpc_connection_cancel(conn);
+    xpc_release(conn);
     if (result < 0) sXPCFailed = 1;
     return result;
 }
@@ -1082,6 +1110,7 @@ void FDReleaseAccess(int64_t handle) {
 
 // Safe grant: only strategies 1-8 (no MCM-C2 iterate, no XPC direct, no LS-PROXY, no container_create_or_lookup)
 static int64_t _FDGrantAccessSafeLocked(const char *path) {
+  @autoreleasepool {
     NSString *cleanPath = [NSString stringWithUTF8String:path];
     if ([cleanPath hasSuffix:@"/"])
         cleanPath = [cleanPath substringToIndex:cleanPath.length - 1];
@@ -1283,6 +1312,7 @@ static int64_t _FDGrantAccessSafeLocked(const char *path) {
 
     // Strategies 9-12 OMITTED — they crash on protected/system paths
     return -1;
+  } // @autoreleasepool
 }
 
 int64_t FDGrantAccessSafe(const char *path) {
@@ -2237,10 +2267,12 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
         NSString *path = [sCSStoreBIDToBundlePath objectForKey:bundleID];
         if (path) {
             pthread_mutex_unlock(&sEngineMutex);
+            NSLog(@"[FD-BNDL] %@ → M1(csstore) = %@", bundleID, path);
             return path;
         }
     }
     pthread_mutex_unlock(&sEngineMutex);
+    NSLog(@"[FD-BNDL] %@ M1(csstore) miss", bundleID);
 
     // Method 2: LSApplicationProxy (no mutex needed, runtime API)
     @try {
@@ -2263,6 +2295,7 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                         if ([path hasPrefix:@"/var/"])
                             path = [@"/private" stringByAppendingString:path];
                         if (path.length > 0) {
+                            NSLog(@"[FD-BNDL] %@ → M2(LSProxy) = %@", bundleID, path);
                             pthread_mutex_lock(&sEngineMutex);
                             if (!sCSStoreBIDToBundlePath)
                                 sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
@@ -2271,11 +2304,12 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                             return path;
                         }
                     }
+                    NSLog(@"[FD-BNDL] %@ M2(LSProxy) proxy exists but no URL", bundleID);
                 }
             }
         }
     } @catch (NSException *e) {
-        NSLog(@"[FD] LSProxy bundle exception for %@: %@", bundleID, e);
+        NSLog(@"[FD-BNDL] %@ M2(LSProxy) exception: %@", bundleID, e);
     }
 
     // Method 3: MCM class-2 with part=1 (no outer mutex — MCM has own locking)
@@ -2304,6 +2338,7 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                 xpc_release(xid);
                 api->queryFree(q);
                 if (path.length > 0 && path.isAbsolutePath) {
+                    NSLog(@"[FD-BNDL] %@ → M3(MCM-C2) f=%d = %@", bundleID, f, path);
                     pthread_mutex_lock(&sEngineMutex);
                     if (!sCSStoreBIDToBundlePath)
                         sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
@@ -2313,28 +2348,30 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                 }
             }
         }
+        NSLog(@"[FD-BNDL] %@ M3(MCM-C2) all flags failed", bundleID);
     } @catch (NSException *e) {
-        NSLog(@"[FD] MCM bundle query exception for %@: %@", bundleID, e);
+        NSLog(@"[FD-BNDL] %@ M3(MCM-C2) exception: %@", bundleID, e);
     }
 
     // Method 4: Bulk scan /private/var/containers/Bundle/Application/
     @try {
-        static BOOL sBundleScanDone = NO;
-        if (!sBundleScanDone) {
-            sBundleScanDone = YES;
+        static dispatch_once_t sBundleScanOnce;
+        __block NSUInteger scanFound = 0;
+        dispatch_once(&sBundleScanOnce, ^{
             static NSString *const kBundleBase = @"/private/var/containers/Bundle/Application";
-            // Grant sandbox access before scanning — use part=1 for bundle containers
-            _worseQuerySymlinkWithPart(kBundleBase.UTF8String, 1);
+            _worseQuerySymlink(kBundleBase.UTF8String);
             FDGrantAccessSafe(kBundleBase.UTF8String);
             NSFileManager *fm = [NSFileManager defaultManager];
             NSArray *entries = [fm contentsOfDirectoryAtPath:kBundleBase error:nil];
+            NSLog(@"[FD-BNDL] M4 scan: opendir Bundle/Application → %lu entries",
+                  (unsigned long)entries.count);
             NSUInteger found = 0;
             for (NSString *uuid in entries) {
                 @autoreleasepool {
                     NSString *uuidDir = [kBundleBase stringByAppendingPathComponent:uuid];
                     NSArray *appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
                     if (!appEntries.count) {
-                        _worseQuerySymlinkWithPart(uuidDir.UTF8String, 1);
+                        _worseQuerySymlink(uuidDir.UTF8String);
                         appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
                     }
                     if (!appEntries.count) {
@@ -2360,17 +2397,24 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                     }
                 }
             }
-            NSLog(@"[FD] Bundle scan found %lu new bundle paths", (unsigned long)found);
-            // Re-check cache after bulk scan
-            pthread_mutex_lock(&sEngineMutex);
-            NSString *cachedPath = [sCSStoreBIDToBundlePath objectForKey:bundleID];
-            pthread_mutex_unlock(&sEngineMutex);
-            if (cachedPath) return cachedPath;
+            scanFound = found;
+            NSLog(@"[FD-BNDL] M4 scan complete: %lu bundle paths found", (unsigned long)found);
+        });
+        // Re-check cache after bulk scan
+        pthread_mutex_lock(&sEngineMutex);
+        NSString *cachedPath = sCSStoreBIDToBundlePath
+            ? [sCSStoreBIDToBundlePath objectForKey:bundleID] : nil;
+        pthread_mutex_unlock(&sEngineMutex);
+        if (cachedPath) {
+            NSLog(@"[FD-BNDL] %@ → M4(scan) = %@", bundleID, cachedPath);
+            return cachedPath;
         }
+        NSLog(@"[FD-BNDL] %@ M4(scan) miss (scanned=%lu)", bundleID, (unsigned long)scanFound);
     } @catch (NSException *e) {
-        NSLog(@"[FD] Bundle scan exception for %@: %@", bundleID, e);
+        NSLog(@"[FD-BNDL] %@ M4(scan) exception: %@", bundleID, e);
     }
 
+    NSLog(@"[FD-BNDL] %@ ALL METHODS FAILED", bundleID);
     return nil;
 }
 
@@ -2388,7 +2432,7 @@ NSData *FDExtractAppIcon(NSString *bundleID) {
         // Find .app directory inside bundle container
         NSArray *contents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
         if (!contents.count) {
-            _worseQuerySymlinkWithPart(bundlePath.UTF8String, 1);
+            _worseQuerySymlink(bundlePath.UTF8String);
             contents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
         }
         if (!contents.count) {
