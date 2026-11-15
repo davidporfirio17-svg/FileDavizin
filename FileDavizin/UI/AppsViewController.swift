@@ -137,31 +137,26 @@ final class AppsViewController: UIViewController {
                 self.updateTitle()
             }
 
-            // Background: compute sizes, resolve bundle paths, extract icons
+            // Background: compute sizes only (fast, no engine calls)
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 for i in sorted.indices {
-                    var c = sorted[i]
-                    c.computeSize()
-                    let size = c.cachedSize
-                    let ident = c.identifier
+                    autoreleasepool {
+                        var c = sorted[i]
+                        c.computeSize()
+                        let size = c.cachedSize
+                        let ident = c.identifier
 
-                    let bundlePath = FileAccessBridge.resolveBundlePath(bundleID: ident)
-                    let icon = FileAccessBridge.extractAppIcon(bundleID: ident)
-
-                    DispatchQueue.main.async {
-                        guard let self else { return }
-                        if let idx = self.allContainers.firstIndex(where: { $0.identifier == ident }) {
-                            self.allContainers[idx].cachedSize = size
-                            if let bp = bundlePath { self.allContainers[idx].bundlePath = bp }
-                            if let ic = icon { self.allContainers[idx].iconImage = ic }
-                        }
-                        if let visIdx = self.filteredContainers.firstIndex(where: { $0.identifier == ident }) {
-                            self.filteredContainers[visIdx].cachedSize = size
-                            if let bp = bundlePath { self.filteredContainers[visIdx].bundlePath = bp }
-                            if let ic = icon { self.filteredContainers[visIdx].iconImage = ic }
-                            let ip = IndexPath(item: visIdx, section: 0)
-                            if let cell = self.collectionView.cellForItem(at: ip) as? AppCell {
-                                cell.configure(with: self.filteredContainers[visIdx])
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            if let idx = self.allContainers.firstIndex(where: { $0.identifier == ident }) {
+                                self.allContainers[idx].cachedSize = size
+                            }
+                            if let visIdx = self.filteredContainers.firstIndex(where: { $0.identifier == ident }) {
+                                self.filteredContainers[visIdx].cachedSize = size
+                                let ip = IndexPath(item: visIdx, section: 0)
+                                if let cell = self.collectionView.cellForItem(at: ip) as? AppCell {
+                                    cell.configure(with: self.filteredContainers[visIdx])
+                                }
                             }
                         }
                     }
