@@ -268,6 +268,7 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
 
     _ensureEngineMutex();
     pthread_mutex_lock(&sEngineMutex);
+    @try {
     @autoreleasepool {
 
         static const uint64_t kFlagSets[] = {
@@ -380,7 +381,6 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                         FDLog([NSString stringWithFormat:
                             @"WQ-SYM success g[%d] f=%d → %s", g, fi, targetPath]);
                         close(libraryFd);
-                        pthread_mutex_unlock(&sEngineMutex);
                         return handle;
                     }
                     NSLog(@"[FD-SYM] g[%d] f=%d handle=%lld but open errno=%d %s",
@@ -392,8 +392,10 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
             close(libraryFd);
         }
 
-        pthread_mutex_unlock(&sEngineMutex);
         return -1;
+    }
+    } @finally {
+        pthread_mutex_unlock(&sEngineMutex);
     }
 }
 
@@ -425,11 +427,11 @@ static const int kAnchorCount = sizeof(kAnchors) / sizeof(kAnchors[0]);
 static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) {
     _ensureEngineMutex();
     pthread_mutex_lock(&sEngineMutex);
+    @try {
 
     MCMAPI *api = FDGetAPI();
     if (!api->queryCreate || !api->querySetPartDomain || !api->queryGetSingle ||
         !api->objectCopy || !api->objectActivate) {
-        pthread_mutex_unlock(&sEngineMutex);
         return -1;
     }
 
@@ -439,7 +441,6 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
     else if (strncmp(targetPath, "/var/", 5) == 0)
         relPath = targetPath + 5;
     else {
-        pthread_mutex_unlock(&sEngineMutex);
         return -1;
     }
 
@@ -490,7 +491,6 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
                                 _storeLease(api, q, act, leaseLabel ?: a->identifier, targetPath);
                                 free(token);
                                 xpc_release(xid);
-                                pthread_mutex_unlock(&sEngineMutex);
                                 return 9100 + i;
                             }
                         }
@@ -509,7 +509,6 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
                         a->label, hasToken, activated, targetPath]);
                     _storeLease(api, q, act, leaseLabel ?: a->identifier, targetPath);
                     xpc_release(xid);
-                    pthread_mutex_unlock(&sEngineMutex);
                     return 9100 + i;
                 }
                 if (api->objectFree) api->objectFree(act);
@@ -520,8 +519,11 @@ static int64_t _worseQueryGrant(const char *targetPath, const char *leaseLabel) 
         api->queryFree(q);
     }
 
-    pthread_mutex_unlock(&sEngineMutex);
     return -1;
+
+    } @finally {
+        pthread_mutex_unlock(&sEngineMutex);
+    }
 }
 
 #pragma mark - Aggressive sandbox techniques
@@ -1056,9 +1058,11 @@ int64_t FDGrantAccess(const char *path) {
     if (!path || path[0] != '/') return -1;
     _ensureEngineMutex();
     pthread_mutex_lock(&sEngineMutex);
-    int64_t result = _FDGrantAccessLocked(path);
-    pthread_mutex_unlock(&sEngineMutex);
-    return result;
+    @try {
+        return _FDGrantAccessLocked(path);
+    } @finally {
+        pthread_mutex_unlock(&sEngineMutex);
+    }
 }
 
 void FDReleaseAccess(int64_t handle) {
@@ -2291,12 +2295,14 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
         NSLog(@"[FD] MCM bundle query exception for %@: %@", bundleID, e);
     }
 
-    // Method 4: Bulk scan /private/var/containers/Bundle/Application/ (world-readable)
+    // Method 4: Bulk scan /private/var/containers/Bundle/Application/
     @try {
         static BOOL sBundleScanDone = NO;
         if (!sBundleScanDone) {
             sBundleScanDone = YES;
             static NSString *const kBundleBase = @"/private/var/containers/Bundle/Application";
+            // Grant sandbox access before scanning
+            FDGrantAccessSafe(kBundleBase.UTF8String);
             NSFileManager *fm = [NSFileManager defaultManager];
             NSArray *entries = [fm contentsOfDirectoryAtPath:kBundleBase error:nil];
             NSUInteger found = 0;
@@ -2304,6 +2310,10 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                 @autoreleasepool {
                     NSString *uuidDir = [kBundleBase stringByAppendingPathComponent:uuid];
                     NSArray *appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
+                    if (!appEntries.count) {
+                        FDGrantAccessSafe(uuidDir.UTF8String);
+                        appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
+                    }
                     for (NSString *entry in appEntries) {
                         if (![entry hasSuffix:@".app"]) continue;
                         NSString *plistPath = [[uuidDir stringByAppendingPathComponent:entry]
@@ -3039,6 +3049,7 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
 NSArray<NSDictionary *> *FDProbeAccessiblePaths(void) {
     _ensureEngineMutex();
     pthread_mutex_lock(&sEngineMutex);
+    @try {
 
     static const struct { const char *path; const char *label; const char *category; } kPaths[] = {
         // Raiz
@@ -3205,6 +3216,9 @@ NSArray<NSDictionary *> *FDProbeAccessiblePaths(void) {
         if ([d[@"accessible"] boolValue]) totalAccessible++;
     }
     NSLog(@"[FD] FDProbeAccessiblePaths: %d/%lu accessible", totalAccessible, (unsigned long)results.count);
-    pthread_mutex_unlock(&sEngineMutex);
     return results;
+
+    } @finally {
+        pthread_mutex_unlock(&sEngineMutex);
+    }
 }
