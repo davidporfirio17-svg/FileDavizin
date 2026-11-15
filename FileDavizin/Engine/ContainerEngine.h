@@ -23,7 +23,7 @@ int64_t FDGrantAccessSafe(const char *path);
 void FDReleaseAccess(int64_t handle);
 
 /// Enumerate installed app containers.
-/// Returns an array of dictionaries with keys "identifier" and "path".
+/// Returns an array of dictionaries with keys "identifier", "path", and optionally "bundlePath".
 NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limit);
 
 /// Test whether the engine can write to a directory.

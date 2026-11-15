@@ -1310,7 +1310,16 @@ static int64_t _FDGrantAccessSafeLocked(const char *path) {
         NSLog(@"[FD-Safe] PARENT exception: %@", e.reason);
     }
 
-    // Strategies 9-12 OMITTED — they crash on protected/system paths
+    // Strategy 9: container_create_or_lookup (bundle paths only — safe for app/grp classes)
+    if (strstr(pathC, "/containers/Bundle/") || strstr(pathC, "/Bundle/Application/")) {
+        @try {
+            int64_t clH = _tryContainerCreateLookup(pathC);
+            if (clH >= 0) return clH;
+        } @catch (NSException *e) {
+            NSLog(@"[FD-Safe] C-LOOKUP-BUNDLE exception: %@", e.reason);
+        }
+    }
+
     return -1;
   } // @autoreleasepool
 }
@@ -1896,6 +1905,38 @@ static NSString *_mcmResolvePath(NSString *bundleID) {
     return nil;
 }
 
+static NSString *_mcmResolveBundlePath(NSString *bundleID) {
+    MCMAPI *api = FDGetAPI();
+    if (!api->queryCreate || !api->querySetIdentifiers || !api->queryGetSingle || !api->objectGetPath)
+        return nil;
+    if (!api->querySetPart) return nil;
+
+    static const uint64_t kFlags[] = { 0x900000000ULL, 0x8100000000ULL };
+    for (int f = 0; f < 2; f++) {
+        void *q = api->queryCreate();
+        if (!q) continue;
+        api->querySetClass(q, 2);
+        xpc_object_t xid = xpc_string_create(bundleID.UTF8String);
+        api->querySetIdentifiers(q, xid);
+        api->querySetFlags(q, kFlags[f]);
+        api->querySetPart(q, 1);
+        void *res = api->queryGetSingle(q);
+        NSString *path = nil;
+        if (res) {
+            const char *raw = api->objectGetPath(res);
+            if (raw) {
+                path = [NSString stringWithUTF8String:raw];
+                if (path && ([path isEqualToString:@"/var"] || [path hasPrefix:@"/var/"]))
+                    path = [@"/private" stringByAppendingString:path];
+            }
+        }
+        xpc_release(xid);
+        api->queryFree(q);
+        if (path.length > 0 && path.isAbsolutePath) return path;
+    }
+    return nil;
+}
+
 #pragma mark - FDEnumerateApps
 
 static NSArray<NSDictionary<NSString *, NSString *> *> *_scanAllContainers(NSUInteger limit) {
@@ -2153,6 +2194,46 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
             [results addObject:dict];
             if (results.count >= limit) break;
         }
+    }
+
+    // Pass 4: Enrich with bundle paths (csstore cache + MCM class-2 part=1)
+    {
+        pthread_mutex_lock(&sEngineMutex);
+        NSDictionary *bundlePathMap = sCSStoreBIDToBundlePath
+            ? [[sCSStoreBIDToBundlePath copy] autorelease] : @{};
+        pthread_mutex_unlock(&sEngineMutex);
+
+        int bpFromCache = 0;
+        int bpFromMCM = 0;
+        int bpMCMConsecFails = 0;
+        for (NSDictionary *dict in results) {
+            @autoreleasepool {
+                NSString *bid = dict[@"identifier"];
+                if (!bid) continue;
+                NSString *bp = bundlePathMap[bid];
+                if (bp) {
+                    [(NSMutableDictionary *)dict setObject:bp forKey:@"bundlePath"];
+                    bpFromCache++;
+                    continue;
+                }
+                if (bpMCMConsecFails >= 20) continue;
+                bp = _mcmResolveBundlePath(bid);
+                if (bp) {
+                    [(NSMutableDictionary *)dict setObject:bp forKey:@"bundlePath"];
+                    bpFromMCM++;
+                    bpMCMConsecFails = 0;
+                    pthread_mutex_lock(&sEngineMutex);
+                    if (!sCSStoreBIDToBundlePath)
+                        sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+                    [sCSStoreBIDToBundlePath setObject:bp forKey:bid];
+                    pthread_mutex_unlock(&sEngineMutex);
+                } else {
+                    bpMCMConsecFails++;
+                }
+            }
+        }
+        FDLog([NSString stringWithFormat:@"Bundle paths: cache=%d MCM=%d (MCM-consec-fails=%d)",
+               bpFromCache, bpFromMCM, bpMCMConsecFails]);
     }
 
     FDLog([NSString stringWithFormat:@"Total enumerated: %lu containers",
@@ -3035,6 +3116,15 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
                     NSLog(@"[FD] ListDir BQ-AG exception: %@", e);
                 }
                 dp = opendir(dirPath);
+            }
+        }
+
+        if (!dp && (strstr(dirPath, "/containers/Bundle/") || strstr(dirPath, "/Bundle/Application"))) {
+            @try {
+                int64_t clH = _tryContainerCreateLookup(dirPath);
+                if (clH >= 0) dp = opendir(dirPath);
+            } @catch (NSException *e) {
+                NSLog(@"[FD] ListDir C-LOOKUP-Bundle exception: %@", e);
             }
         }
 

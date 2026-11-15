@@ -29,21 +29,26 @@ enum FileAccessBridge {
         FDReleaseAccess(handle)
     }
 
-    static func enumerateInstalledApps(limit: Int = 500) -> [(identifier: String, path: String)] {
+    static func enumerateInstalledApps(limit: Int = 500) -> [(identifier: String, path: String, bundlePath: String?)] {
         let raw = FDEnumerateApps(UInt(limit))
         return raw.compactMap { dict in
             guard let ident = dict["identifier"] else { return nil }
             let path = dict["path"] ?? ""
-            return (identifier: ident, path: path)
+            let bundlePath = dict["bundlePath"]
+            return (identifier: ident, path: path, bundlePath: bundlePath)
         }
     }
 
     static func discoverAllContainers() -> [AppContainer] {
-        var raw: [(identifier: String, path: String)] = []
+        var raw: [(identifier: String, path: String, bundlePath: String?)] = []
         FDTryObjC({
             raw = enumerateInstalledApps()
         }, nil)
-        return raw.map { AppContainer(identifier: $0.identifier, path: $0.path) }
+        return raw.map {
+            var c = AppContainer(identifier: $0.identifier, path: $0.path)
+            c.bundlePath = $0.bundlePath
+            return c
+        }
     }
 
     static func resolveBundlePath(bundleID: String) -> String? {
