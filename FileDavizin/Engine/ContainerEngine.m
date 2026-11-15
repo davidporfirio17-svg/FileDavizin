@@ -602,13 +602,21 @@ static void _attemptSandboxRelax(void) {
 }
 
 static int64_t _tryContainerCreateLookup(const char *targetPath) {
-    static int sLookupFailed = 0;
-    if (sLookupFailed) return -1;
+    static int sLookupFailCount = 0;
+    static int sLookupNoSymbol = 0;
+    if (sLookupNoSymbol) return -1;
+    if (sLookupFailCount >= 10) return -1;
+
+    if (!targetPath || targetPath[0] != '/') return -1;
+    if (!strstr(targetPath, "/Containers/") && !strstr(targetPath, "/containers/") &&
+        !strstr(targetPath, "/Bundle/Application/") && !strstr(targetPath, "/AppGroup/")) {
+        return -1;
+    }
 
     typedef const char *(*ContainerLookup_t)(uint64_t, const char *, void **, char **);
     ContainerLookup_t lookup = (ContainerLookup_t)dlsym(RTLD_DEFAULT,
         "container_create_or_lookup_path_for_current_user");
-    if (!lookup) { sLookupFailed = 1; return -1; }
+    if (!lookup) { sLookupNoSymbol = 1; return -1; }
 
     SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT,
                                                              "sandbox_extension_consume");
@@ -645,7 +653,7 @@ static int64_t _tryContainerCreateLookup(const char *targetPath) {
             free(token);
         }
     }
-    sLookupFailed = 1;
+    sLookupFailCount++;
     return -1;
 }
 
@@ -713,8 +721,8 @@ static int64_t _tryLSProxyGrant(const char *targetPath) {
 }
 
 static int64_t _tryDirectContainerdXPC(const char *targetPath) {
-    static int sXPCFailed = 0;
-    if (sXPCFailed) return -1;
+    static int sXPCFailCount = 0;
+    if (sXPCFailCount >= 3) return -1;
 
     typedef xpc_connection_t (*XPCCreateMachService_t)(const char *, dispatch_queue_t, uint64_t);
     XPCCreateMachService_t createMach = (XPCCreateMachService_t)dlsym(RTLD_DEFAULT,
@@ -722,7 +730,7 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
     if (!createMach) { sXPCFailed = 1; return -1; }
 
     xpc_connection_t conn = createMach("com.apple.containermanagerd", NULL, 0);
-    if (!conn) { sXPCFailed = 1; return -1; }
+    if (!conn) { sXPCFailCount++; return -1; }
 
     xpc_connection_set_event_handler(conn, ^(xpc_object_t __unused event) {});
     xpc_connection_resume(conn);
@@ -741,19 +749,15 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
         xpc_dictionary_set_bool(msg, "activate", true);
         xpc_dictionary_set_string(msg, "bundle-id", "com.apple.mobile.MobileHouseArrest");
 
-        __block xpc_object_t reply = NULL;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        xpc_connection_send_message_with_reply(conn, msg, dispatch_get_global_queue(0, 0),
-            ^(xpc_object_t r) { if (r) xpc_retain(r); reply = r; dispatch_semaphore_signal(sem); });
-        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 500000000LL));
+        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, msg);
         xpc_release(msg);
-        dispatch_release(sem);
-        if (waited != 0) {
-            NSLog(@"[FD-XPC] timeout op=%llu", kOps[oi]);
+
+        if (!reply) {
+            NSLog(@"[FD-XPC] no reply op=%llu", kOps[oi]);
             continue;
         }
 
-        if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+        if (xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
             const char *token = xpc_dictionary_get_string(reply, "sandbox-extension");
             if (!token) token = xpc_dictionary_get_string(reply, "token");
             if (!token) token = xpc_dictionary_get_string(reply, "extension");
@@ -770,12 +774,12 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
                 }
             }
         }
-        if (reply) xpc_release(reply);
+        xpc_release(reply);
     }
 
     xpc_connection_cancel(conn);
     xpc_release(conn);
-    if (result < 0) sXPCFailed = 1;
+    if (result < 0) sXPCFailCount++;
     return result;
 }
 
@@ -1077,12 +1081,17 @@ static int64_t _FDGrantAccessLocked(const char *path) {
         _diagAppend("LS-PROXY fail | ");
     }
 
-    // Strategy 12: container_create_or_lookup_path_for_current_user
-    {
-        int64_t clH = _tryContainerCreateLookup(pathC);
-        if (clH >= 0) {
-            _diagAppend("C-LOOKUP OK h=%lld", (long long)clH);
-            return 9400;
+    // Strategy 12: container_create_or_lookup (container paths only)
+    if (strstr(pathC, "/Containers/") || strstr(pathC, "/containers/") ||
+        strstr(pathC, "/Bundle/Application/") || strstr(pathC, "/AppGroup/")) {
+        @try {
+            int64_t clH = _tryContainerCreateLookup(pathC);
+            if (clH >= 0) {
+                _diagAppend("C-LOOKUP OK h=%lld", (long long)clH);
+                return 9400;
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[FD] C-LOOKUP exception: %@", e.reason);
         }
         _diagAppend("C-LOOKUP fail | ");
     }
@@ -3166,6 +3175,7 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
         struct dirent *entry;
         while ((entry = readdir(dp)) != NULL) {
             if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            @autoreleasepool {
 
             NSString *name = [NSString stringWithUTF8String:entry->d_name];
             if (!name) continue;
@@ -3224,6 +3234,8 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
                 @"isHidden": @(isHidden),
                 @"isSymlink": @(isSymlink),
             }];
+
+            } // @autoreleasepool
         }
         closedir(dp);
 
@@ -3378,8 +3390,7 @@ NSArray<NSDictionary *> *FDProbeAccessiblePaths(void) {
         // Try opendir first without granting
         DIR *dp = opendir(kPaths[i].path);
         if (!dp) {
-            // Try granting access
-            FDGrantAccess(kPaths[i].path);
+            FDGrantAccessSafe(kPaths[i].path);
             dp = opendir(kPaths[i].path);
         }
         int count = 0;
