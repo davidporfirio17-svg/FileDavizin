@@ -602,6 +602,12 @@ static void _attemptSandboxRelax(void) {
 }
 
 static int64_t _tryContainerCreateLookup(const char *targetPath) {
+    // Disabled: container_create_or_lookup_path_for_current_user causes SIGSEGV
+    // on iOS 27.2 — a C-level crash that @try/@catch cannot intercept.
+    // The function never succeeds on this OS version anyway.
+    (void)targetPath;
+    return -1;
+#if 0
     static int sLookupFailCount = 0;
     static int sLookupNoSymbol = 0;
     if (sLookupNoSymbol) return -1;
@@ -655,6 +661,7 @@ static int64_t _tryContainerCreateLookup(const char *targetPath) {
     }
     sLookupFailCount++;
     return -1;
+#endif
 }
 
 static NSArray *_cachedLSApps(void) {
@@ -721,6 +728,11 @@ static int64_t _tryLSProxyGrant(const char *targetPath) {
 }
 
 static int64_t _tryDirectContainerdXPC(const char *targetPath) {
+    // Disabled: sync XPC send has no timeout and can block indefinitely.
+    // The function never succeeds on iOS 27.2 anyway.
+    (void)targetPath;
+    return -1;
+#if 0
     static int sXPCFailCount = 0;
     if (sXPCFailCount >= 3) return -1;
 
@@ -781,6 +793,7 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
     xpc_release(conn);
     if (result < 0) sXPCFailCount++;
     return result;
+#endif
 }
 
 #pragma mark - FDGrantAccess
