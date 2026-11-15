@@ -1066,6 +1066,213 @@ void FDReleaseAccess(int64_t handle) {
     if (handle >= 0) bad_query_release(handle);
 }
 
+// Safe grant: only strategies 1-8 (no MCM-C2 iterate, no XPC direct, no LS-PROXY, no container_create_or_lookup)
+static int64_t _FDGrantAccessSafeLocked(const char *path) {
+    NSString *cleanPath = [NSString stringWithUTF8String:path];
+    if ([cleanPath hasSuffix:@"/"])
+        cleanPath = [cleanPath substringToIndex:cleanPath.length - 1];
+    const char *pathC = cleanPath.UTF8String;
+
+    MCMAPI *api = FDGetAPI();
+    SBXExtConsumeFunc consumeExt = (SBXExtConsumeFunc)dlsym(RTLD_DEFAULT, "sandbox_extension_consume");
+    SBXExtReleaseFunc releaseExt = (SBXExtReleaseFunc)dlsym(RTLD_DEFAULT, "sandbox_extension_release");
+
+    // Pre-check: already accessible?
+    @try {
+        int fd = open(pathC, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) { close(fd); return 9999; }
+    } @catch (NSException *e) {}
+
+    // Strategy 1: WQ-SYM
+    @try {
+        int64_t h = _worseQuerySymlink(pathC);
+        if (h >= 0) return h;
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] WQ-SYM exception: %@", e.reason);
+    }
+
+    // Strategy 2: WQ partDomain
+    @try {
+        int64_t h = _worseQueryGrant(pathC, "fd-safe");
+        if (h >= 0) return h;
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] WQ-PD exception: %@", e.reason);
+    }
+
+    // Strategy 3: sandbox_extension_issue_file
+    @try {
+        SandboxIssueFileFunc issueFile = (SandboxIssueFileFunc)dlsym(RTLD_DEFAULT,
+                                                                      "sandbox_extension_issue_file");
+        SandboxIssueFilePidFunc issueFilePid = (SandboxIssueFilePidFunc)dlsym(RTLD_DEFAULT,
+            "sandbox_extension_issue_file_to_process_by_pid");
+
+        static const char *kExtClasses[] = {
+            "com.apple.app-sandbox.read-write",
+            "com.apple.app-sandbox.read",
+            "com.apple.sandbox.container",
+            "com.apple.security.exception.files.absolute-path.read-write",
+            "com.apple.mobile.house_arrest.readwrite",
+            "com.apple.mobile.house_arrest.readonly",
+            "com.apple.mobile.house_arrest",
+            "com.apple.sandbox.system-group",
+            "com.apple.security.exception.files.absolute-path.read-only",
+            "com.apple.app-sandbox.read-write.file-mode.metadata-only",
+        };
+        int nClasses = sizeof(kExtClasses) / sizeof(kExtClasses[0]);
+
+        for (int ci = 0; ci < nClasses; ci++) {
+            if (issueFile && consumeExt) {
+                char *token = issueFile(kExtClasses[ci], pathC, 0);
+                if (token) {
+                    int64_t h = consumeExt(token);
+                    if (h >= 0) {
+                        int fd = open(pathC, O_RDONLY | O_CLOEXEC);
+                        if (fd >= 0) { close(fd); free(token); return h; }
+                    }
+                    if (h >= 0 && releaseExt) releaseExt(h);
+                    free(token);
+                }
+            }
+            if (issueFilePid && consumeExt) {
+                char *token = issueFilePid(kExtClasses[ci], pathC, 0, getpid());
+                if (token) {
+                    int64_t h = consumeExt(token);
+                    if (h >= 0) {
+                        int fd = open(pathC, O_RDONLY | O_CLOEXEC);
+                        if (fd >= 0) { close(fd); free(token); return h; }
+                    }
+                    if (h >= 0 && releaseExt) releaseExt(h);
+                    free(token);
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] ISSUE exception: %@", e.reason);
+    }
+
+    // Strategy 4: MCM class-7 app group activation
+    @try {
+        const char **rtGroups; int rtGroupCount;
+        _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
+        if (api->queryCreate && api->querySetGroupIdentifiers && api->objectActivate) {
+            for (int g = 0; g < rtGroupCount; g++) {
+                static const uint64_t kGrantFlags[] = { 0x900000000ULL, 0x8100000000ULL };
+                for (int fi = 0; fi < 2; fi++) {
+                    void *q = api->queryCreate();
+                    if (!q) continue;
+                    api->querySetClass(q, 7);
+                    xpc_object_t xid = xpc_string_create(rtGroups[g]);
+                    api->querySetGroupIdentifiers(q, xid);
+                    api->querySetFlags(q, kGrantFlags[fi]);
+                    if (api->querySetPart) api->querySetPart(q, 0);
+                    void *res = api->queryGetSingle(q);
+                    if (res && api->objectCopy) {
+                        void *act = api->objectCopy(res);
+                        if (act) {
+                            char *token = api->objectCopyToken ? api->objectCopyToken(act) : NULL;
+                            bool activated = false;
+                            if (token && token[0] != '\0')
+                                activated = api->objectActivate(act, false);
+                            free(token);
+                            if (activated) {
+                                int fd = open(pathC, O_RDONLY | O_CLOEXEC);
+                                if (fd >= 0) {
+                                    close(fd);
+                                    _storeLease(api, q, act, rtGroups[g], pathC);
+                                    xpc_release(xid);
+                                    return 9000 + g;
+                                }
+                            }
+                            if (api->objectFree) api->objectFree(act);
+                        }
+                        act = api->objectCopy(res);
+                        if (act) {
+                            bool ok = api->objectActivate(act, true);
+                            if (ok) {
+                                int fd = open(pathC, O_RDONLY | O_CLOEXEC);
+                                if (fd >= 0) {
+                                    close(fd);
+                                    _storeLease(api, q, act, rtGroups[g], pathC);
+                                    xpc_release(xid);
+                                    return 9050 + g;
+                                }
+                            }
+                            if (api->objectFree) api->objectFree(act);
+                        }
+                    }
+                    xpc_release(xid);
+                    api->queryFree(q);
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] MCM-C7 exception: %@", e.reason);
+    }
+
+    // Strategy 5: bad_query class-13
+    @try {
+        int64_t h = bad_query((char *)pathC, true, NULL, false);
+        if (h >= 0) return h;
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] BQ-C13 exception: %@", e.reason);
+    }
+
+    // Strategy 6: bad_query per app group
+    @try {
+        const char **rtGroups; int rtGroupCount;
+        _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
+        for (int g = 0; g < rtGroupCount; g++) {
+            int64_t h = bad_query((char *)pathC, true, (char *)rtGroups[g], false);
+            if (h >= 0) return h;
+            h = bad_query((char *)pathC, false, (char *)rtGroups[g], false);
+            if (h >= 0) return h;
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] BQ-AG exception: %@", e.reason);
+    }
+
+    // Strategy 7: Direct open() hail mary
+    @try {
+        int flags[] = { O_RDONLY, O_RDONLY | O_DIRECTORY, O_RDONLY | O_CLOEXEC };
+        for (int i = 0; i < 3; i++) {
+            int fd = open(pathC, flags[i]);
+            if (fd >= 0) { close(fd); return 9900 + i; }
+        }
+    } @catch (NSException *e) {}
+
+    // Strategy 8: Parent directory then re-check
+    @try {
+        NSString *parent = [cleanPath stringByDeletingLastPathComponent];
+        if (parent.length > 1) {
+            int64_t ph = _worseQuerySymlink(parent.UTF8String);
+            if (ph < 0) ph = _worseQueryGrant(parent.UTF8String, "fd-parent-safe");
+            if (ph >= 0) {
+                int fd = open(pathC, O_RDONLY | O_CLOEXEC);
+                if (fd >= 0) { close(fd); return ph; }
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] PARENT exception: %@", e.reason);
+    }
+
+    // Strategies 9-12 OMITTED — they crash on protected/system paths
+    return -1;
+}
+
+int64_t FDGrantAccessSafe(const char *path) {
+    if (!path || path[0] != '/') return -1;
+    _ensureEngineMutex();
+    pthread_mutex_lock(&sEngineMutex);
+    int64_t result = -1;
+    @try {
+        result = _FDGrantAccessSafeLocked(path);
+    } @catch (NSException *e) {
+        NSLog(@"[FD-Safe] top-level exception: %@", e.reason);
+    }
+    pthread_mutex_unlock(&sEngineMutex);
+    return result;
+}
+
 #pragma mark - FDCanWrite
 
 BOOL FDCanWrite(const char *dirPath) {

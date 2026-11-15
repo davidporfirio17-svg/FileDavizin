@@ -15,6 +15,10 @@ NSString * _Nullable FDDiscoverContainerPath(NSString *bundleID);
 /// Returns a handle >= 0 on success, < 0 on failure.
 int64_t FDGrantAccess(const char *path);
 
+/// Safe variant — only uses strategies that cannot crash on protected paths.
+/// Skips MCM-C2 iterate, XPC direct, LS-PROXY, container_create_or_lookup.
+int64_t FDGrantAccessSafe(const char *path);
+
 /// Release a previously obtained sandbox access grant.
 void FDReleaseAccess(int64_t handle);
 

@@ -213,7 +213,7 @@ final class FilePreviewController: UIViewController {
     }
 
     private func addPlistPreview() {
-        let _ = FileAccessBridge.grantAccess(path: (node.path as NSString).deletingLastPathComponent)
+        let _ = FileAccessBridge.grantAccessSafe(path: (node.path as NSString).deletingLastPathComponent)
         if let dict = NSDictionary(contentsOfFile: node.path) {
             let textView = makeTextView()
             var lines: [String] = []

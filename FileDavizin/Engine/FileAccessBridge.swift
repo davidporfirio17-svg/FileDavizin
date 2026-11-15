@@ -17,6 +17,14 @@ enum FileAccessBridge {
         return result
     }
 
+    static func grantAccessSafe(path: String) -> Int64 {
+        var result: Int64 = -1
+        FDTryObjC({
+            result = FDGrantAccessSafe(path)
+        }, nil)
+        return result
+    }
+
     static func releaseAccess(handle: Int64) {
         FDReleaseAccess(handle)
     }
@@ -112,7 +120,7 @@ enum FileAccessBridge {
             return data
         }
         let dir = (path as NSString).deletingLastPathComponent
-        let _ = grantAccess(path: dir)
+        let _ = grantAccessSafe(path: dir)
         return FileManager.default.contents(atPath: path)
     }
 

@@ -145,9 +145,9 @@ final class PatchesViewController: UIViewController {
             return
         }
 
-        let _ = FileAccessBridge.grantAccess(path: patch.targetPath)
+        let _ = FileAccessBridge.grantAccessSafe(path: patch.targetPath)
         let dir = (patch.targetPath as NSString).deletingLastPathComponent
-        let _ = FileAccessBridge.grantAccess(path: dir)
+        let _ = FileAccessBridge.grantAccessSafe(path: dir)
 
         guard var data = FileAccessBridge.readFile(at: patch.targetPath) else {
             showAlert("Error", "No se pudo leer el archivo: \(patch.targetPath)")
