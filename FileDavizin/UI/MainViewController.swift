@@ -2,9 +2,7 @@ import UIKit
 
 final class MainViewController: UIViewController {
     private let appsVC = AppsViewController()
-    private let systemVC = FileBrowserViewController(
-        path: "/private/var/mobile",
-        title: "Sistema")
+    private let systemVC = SystemBrowserViewController()
     private let patchesVC = PatchesViewController()
     private let settingsVC = SettingsViewController()
 
