@@ -727,7 +727,7 @@ static int64_t _tryDirectContainerdXPC(const char *targetPath) {
     typedef xpc_connection_t (*XPCCreateMachService_t)(const char *, dispatch_queue_t, uint64_t);
     XPCCreateMachService_t createMach = (XPCCreateMachService_t)dlsym(RTLD_DEFAULT,
         "xpc_connection_create_mach_service");
-    if (!createMach) { sXPCFailed = 1; return -1; }
+    if (!createMach) { sXPCFailCount = 3; return -1; }
 
     xpc_connection_t conn = createMach("com.apple.containermanagerd", NULL, 0);
     if (!conn) { sXPCFailCount++; return -1; }
