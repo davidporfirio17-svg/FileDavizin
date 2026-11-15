@@ -254,7 +254,7 @@ static void _getRuntimeAppGroups(const char ***outGroups, int *outCount) {
 typedef int64_t (*SBXExtConsumeFunc)(const char *);
 typedef int (*SBXExtReleaseFunc)(int64_t);
 
-static int64_t _worseQuerySymlink(const char *targetPath) {
+static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
     if (!targetPath || targetPath[0] != '/') return -1;
 
     MCMAPI *api = FDGetAPI();
@@ -278,8 +278,9 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
             0x800000000ULL,
         };
         static const int kFlagCount = 4;
-        static int sKnownGoodFlag = -1;
-        static int sKnownGoodGroup = -1;
+        static int sKnownGoodFlag[2] = {-1, -1};
+        static int sKnownGoodGroup[2] = {-1, -1};
+        int ci = (part == 1) ? 0 : 1;
 
         SBXExtReleaseFunc releaseExt = (SBXExtReleaseFunc)dlsym(RTLD_DEFAULT,
                                                                  "sandbox_extension_release");
@@ -289,8 +290,8 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
         _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
 
         for (int rawG = 0; rawG < rtGroupCount; rawG++) {
-            int g = (sKnownGoodGroup >= 0 && rawG == 0) ? sKnownGoodGroup
-                  : (sKnownGoodGroup >= 0 && rawG <= sKnownGoodGroup) ? rawG - 1
+            int g = (sKnownGoodGroup[ci] >= 0 && rawG == 0) ? sKnownGoodGroup[ci]
+                  : (sKnownGoodGroup[ci] >= 0 && rawG <= sKnownGoodGroup[ci]) ? rawG - 1
                   : rawG;
             NSString *groupID = [NSString stringWithUTF8String:rtGroups[g]];
             NSURL *containerURL = [fm containerURLForSecurityApplicationGroupIdentifier:groupID];
@@ -310,9 +311,9 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
 
             for (int oi = 0; oi < kFlagCount; oi++) {
                 int fi;
-                if (sKnownGoodFlag >= 0) {
-                    if (oi == 0) fi = sKnownGoodFlag;
-                    else if (oi <= sKnownGoodFlag) fi = oi - 1;
+                if (sKnownGoodFlag[ci] >= 0) {
+                    if (oi == 0) fi = sKnownGoodFlag[ci];
+                    else if (oi <= sKnownGoodFlag[ci]) fi = oi - 1;
                     else fi = oi;
                 } else {
                     fi = oi;
@@ -345,7 +346,7 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                 xpc_object_t xid = xpc_string_create(rtGroups[g]);
                 api->querySetGroupIdentifiers(q, xid);
                 api->querySetFlags(q, kFlagSets[fi]);
-                if (api->querySetPart) api->querySetPart(q, 3);
+                if (api->querySetPart) api->querySetPart(q, part);
 
                 void *res = api->queryGetSingle(q);
                 int64_t handle = -6;
@@ -376,16 +377,21 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
                     int fd = open(targetPath, O_RDONLY | O_CLOEXEC);
                     if (fd >= 0) {
                         close(fd);
-                        sKnownGoodFlag = fi;
-                        sKnownGoodGroup = g;
+                        sKnownGoodFlag[ci] = fi;
+                        sKnownGoodGroup[ci] = g;
                         FDLog([NSString stringWithFormat:
-                            @"WQ-SYM success g[%d] f=%d → %s", g, fi, targetPath]);
+                            @"WQ-SYM success g[%d] f=%d p=%d → %s", g, fi, part, targetPath]);
                         close(libraryFd);
                         return handle;
                     }
-                    NSLog(@"[FD-SYM] g[%d] f=%d handle=%lld but open errno=%d %s",
-                          g, fi, (long long)handle, errno, targetPath);
+                    int openErrno = errno;
+                    NSLog(@"[FD-SYM] g[%d] f=%d p=%d handle=%lld but open errno=%d %s",
+                          g, fi, part, (long long)handle, openErrno, targetPath);
                     if (releaseExt) releaseExt(handle);
+                    if (openErrno == ENOENT) {
+                        close(libraryFd);
+                        return -1;
+                    }
                 }
             }
 
@@ -397,6 +403,10 @@ static int64_t _worseQuerySymlink(const char *targetPath) {
     } @finally {
         pthread_mutex_unlock(&sEngineMutex);
     }
+}
+
+static int64_t _worseQuerySymlink(const char *targetPath) {
+    return _worseQuerySymlinkWithPart(targetPath, 3);
 }
 
 #pragma mark - worse_query partDomain traversal (fallback)
@@ -1087,12 +1097,22 @@ static int64_t _FDGrantAccessSafeLocked(const char *path) {
         if (fd >= 0) { close(fd); return 9999; }
     } @catch (NSException *e) {}
 
-    // Strategy 1: WQ-SYM
+    // Strategy 1: WQ-SYM (part=3, data containers)
     @try {
         int64_t h = _worseQuerySymlink(pathC);
         if (h >= 0) return h;
     } @catch (NSException *e) {
         NSLog(@"[FD-Safe] WQ-SYM exception: %@", e.reason);
+    }
+
+    // Strategy 1b: WQ-SYM with part=1 (bundle containers)
+    if (strstr(pathC, "/containers/Bundle/") || strstr(pathC, "/Bundle/Application/")) {
+        @try {
+            int64_t h = _worseQuerySymlinkWithPart(pathC, 1);
+            if (h >= 0) return h;
+        } @catch (NSException *e) {
+            NSLog(@"[FD-Safe] WQ-SYM-Bundle exception: %@", e.reason);
+        }
     }
 
     // Strategy 2: WQ partDomain
@@ -1249,6 +1269,8 @@ static int64_t _FDGrantAccessSafeLocked(const char *path) {
         NSString *parent = [cleanPath stringByDeletingLastPathComponent];
         if (parent.length > 1) {
             int64_t ph = _worseQuerySymlink(parent.UTF8String);
+            if (ph < 0 && (strstr(pathC, "/containers/Bundle/") || strstr(pathC, "/Bundle/Application/")))
+                ph = _worseQuerySymlinkWithPart(parent.UTF8String, 1);
             if (ph < 0) ph = _worseQueryGrant(parent.UTF8String, "fd-parent-safe");
             if (ph >= 0) {
                 int fd = open(pathC, O_RDONLY | O_CLOEXEC);
@@ -2301,7 +2323,8 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
         if (!sBundleScanDone) {
             sBundleScanDone = YES;
             static NSString *const kBundleBase = @"/private/var/containers/Bundle/Application";
-            // Grant sandbox access before scanning
+            // Grant sandbox access before scanning — use part=1 for bundle containers
+            _worseQuerySymlinkWithPart(kBundleBase.UTF8String, 1);
             FDGrantAccessSafe(kBundleBase.UTF8String);
             NSFileManager *fm = [NSFileManager defaultManager];
             NSArray *entries = [fm contentsOfDirectoryAtPath:kBundleBase error:nil];
@@ -2310,6 +2333,10 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                 @autoreleasepool {
                     NSString *uuidDir = [kBundleBase stringByAppendingPathComponent:uuid];
                     NSArray *appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
+                    if (!appEntries.count) {
+                        _worseQuerySymlinkWithPart(uuidDir.UTF8String, 1);
+                        appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
+                    }
                     if (!appEntries.count) {
                         FDGrantAccessSafe(uuidDir.UTF8String);
                         appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
@@ -2359,8 +2386,15 @@ NSData *FDExtractAppIcon(NSString *bundleID) {
         NSFileManager *fm = [NSFileManager defaultManager];
 
         // Find .app directory inside bundle container
-        // Bundle containers are readable without FDGrantAccess
         NSArray *contents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
+        if (!contents.count) {
+            _worseQuerySymlinkWithPart(bundlePath.UTF8String, 1);
+            contents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
+        }
+        if (!contents.count) {
+            FDGrantAccessSafe(bundlePath.UTF8String);
+            contents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
+        }
         NSString *appDir = nil;
         for (NSString *name in contents) {
             if ([name hasSuffix:@".app"]) {
@@ -2491,6 +2525,12 @@ int FDContainerEngineInit(void) {
     // Pass 1: WQ-SYM on all paths (primary for iOS 27+)
     for (int i = 0; i < n; i++) {
         int64_t h = _worseQuerySymlink(kEscapePaths[i]);
+        if (h < 0 && strstr(kEscapePaths[i], "Bundle/")) {
+            h = _worseQuerySymlinkWithPart(kEscapePaths[i], 1);
+            if (h >= 0)
+                FDLog([NSString stringWithFormat:@"init WQ-SYM-Bundle OK: %s h=%lld",
+                       kEscapePaths[i], (long long)h]);
+        }
         if (h >= 0) {
             granted++;
             _diagAppend("init-sym: %s OK | ", kEscapePaths[i]);
@@ -2888,6 +2928,15 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
             dp = opendir(dirPath);
         }
 
+        if (!dp && (strstr(dirPath, "/containers/Bundle/") || strstr(dirPath, "/Bundle/Application"))) {
+            @try {
+                _worseQuerySymlinkWithPart(dirPath, 1);
+            } @catch (NSException *e) {
+                NSLog(@"[FD] ListDir WQ-SYM-Bundle exception: %@", e);
+            }
+            dp = opendir(dirPath);
+        }
+
         if (!dp) {
             // Try parent directory symlink
             char parent[1024];
@@ -2899,6 +2948,13 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
                     _worseQuerySymlink(parent);
                 } @catch (NSException *e) {
                     NSLog(@"[FD] ListDir parent WQ-SYM exception: %@", e);
+                }
+                if (strstr(parent, "/containers/Bundle/") || strstr(parent, "/Bundle/Application")) {
+                    @try {
+                        _worseQuerySymlinkWithPart(parent, 1);
+                    } @catch (NSException *e) {
+                        NSLog(@"[FD] ListDir parent WQ-SYM-Bundle exception: %@", e);
+                    }
                 }
             }
             dp = opendir(dirPath);
