@@ -2613,103 +2613,179 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
     _ensureEngineMutex();
     pthread_mutex_lock(&sEngineMutex);
 
-    // Try opening directly first (works if we have root/sandbox escape)
-    DIR *dp = opendir(dirPath);
+    @try {
+        // Try opening directly first
+        DIR *dp = opendir(dirPath);
 
-    if (!dp) {
-        // Grant access via worse_query and retry
-        FDGrantAccess(dirPath);
-        char parent[1024];
-        strlcpy(parent, dirPath, sizeof(parent));
-        char *slash = strrchr(parent, '/');
-        if (slash && slash != parent) {
-            *slash = '\0';
-            FDGrantAccess(parent);
+        if (!dp) {
+            // Grant access via worse_query symlink (safest, fastest)
+            @try {
+                _worseQuerySymlink(dirPath);
+            } @catch (NSException *e) {
+                NSLog(@"[FD] ListDir WQ-SYM exception: %@", e);
+            }
+            dp = opendir(dirPath);
         }
-        dp = opendir(dirPath);
-    }
 
-    if (!dp) {
-        // Last resort: try bad_query with multiple classes
-        bad_query((char *)dirPath, false, NULL, false);
-        dp = opendir(dirPath);
-    }
+        if (!dp) {
+            // Try parent directory symlink
+            char parent[1024];
+            strlcpy(parent, dirPath, sizeof(parent));
+            char *slash = strrchr(parent, '/');
+            if (slash && slash != parent) {
+                *slash = '\0';
+                @try {
+                    _worseQuerySymlink(parent);
+                } @catch (NSException *e) {
+                    NSLog(@"[FD] ListDir parent WQ-SYM exception: %@", e);
+                }
+            }
+            dp = opendir(dirPath);
+        }
 
-    if (!dp) {
-        NSLog(@"[FD] FDListDirectoryRaw: opendir(%s) failed: %s", dirPath, strerror(errno));
+        if (!dp) {
+            // Try worse_query grant (partDomain)
+            @try {
+                _worseQueryGrant(dirPath, "fd-list");
+            } @catch (NSException *e) {
+                NSLog(@"[FD] ListDir WQ-PD exception: %@", e);
+            }
+            dp = opendir(dirPath);
+        }
+
+        if (!dp) {
+            // Try bad_query
+            @try {
+                bad_query((char *)dirPath, true, NULL, false);
+            } @catch (NSException *e) {
+                NSLog(@"[FD] ListDir BQ exception: %@", e);
+            }
+            dp = opendir(dirPath);
+        }
+
+        if (!dp) {
+            // Try bad_query with each app group
+            const char **rtGroups; int rtGroupCount;
+            _getRuntimeAppGroups(&rtGroups, &rtGroupCount);
+            for (int g = 0; g < rtGroupCount && !dp; g++) {
+                @try {
+                    bad_query((char *)dirPath, true, (char *)rtGroups[g], false);
+                } @catch (NSException *e) {
+                    NSLog(@"[FD] ListDir BQ-AG exception: %@", e);
+                }
+                dp = opendir(dirPath);
+            }
+        }
+
+        if (!dp) {
+            // sandbox_extension_issue_file as last resort
+            @try {
+                typedef char *(*SBXIssueFunc)(const char *, const char *, int);
+                SBXIssueFunc issueFile = (SBXIssueFunc)dlsym(RTLD_DEFAULT,
+                    "sandbox_extension_issue_file");
+                typedef int64_t (*SBXConsumeFunc)(const char *);
+                SBXConsumeFunc consumeExt = (SBXConsumeFunc)dlsym(RTLD_DEFAULT,
+                    "sandbox_extension_consume");
+                if (issueFile && consumeExt) {
+                    const char *exts[] = {
+                        "com.apple.app-sandbox.read",
+                        "com.apple.app-sandbox.read-write",
+                        "com.apple.sandbox.container",
+                    };
+                    for (int e = 0; e < 3 && !dp; e++) {
+                        char *token = issueFile(exts[e], dirPath, 0);
+                        if (token) {
+                            consumeExt(token);
+                            free(token);
+                        }
+                        dp = opendir(dirPath);
+                    }
+                }
+            } @catch (NSException *e) {
+                NSLog(@"[FD] ListDir SBX exception: %@", e);
+            }
+        }
+
+        if (!dp) {
+            NSLog(@"[FD] FDListDirectoryRaw: opendir(%s) FAILED: %s", dirPath, strerror(errno));
+            pthread_mutex_unlock(&sEngineMutex);
+            return @[];
+        }
+
+        NSMutableArray *results = [NSMutableArray array];
+        struct dirent *entry;
+        while ((entry = readdir(dp)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            NSString *name = [NSString stringWithUTF8String:entry->d_name];
+            if (!name) continue;
+
+            char fullPath[2048];
+            snprintf(fullPath, sizeof(fullPath), "%s/%s", dirPath, entry->d_name);
+
+            struct stat st;
+            BOOL didStat = (lstat(fullPath, &st) == 0);
+
+            BOOL isDir = NO;
+            uint64_t size = 0;
+            double modTime = 0;
+            NSString *perms = @"?";
+            BOOL isHidden = (entry->d_name[0] == '.');
+            BOOL isSymlink = NO;
+
+            if (didStat) {
+                isDir = S_ISDIR(st.st_mode);
+                isSymlink = S_ISLNK(st.st_mode);
+                size = (uint64_t)st.st_size;
+                modTime = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
+
+                char p[11];
+                p[0] = S_ISDIR(st.st_mode) ? 'd' : S_ISLNK(st.st_mode) ? 'l' : '-';
+                p[1] = (st.st_mode & S_IRUSR) ? 'r' : '-';
+                p[2] = (st.st_mode & S_IWUSR) ? 'w' : '-';
+                p[3] = (st.st_mode & S_IXUSR) ? 'x' : '-';
+                p[4] = (st.st_mode & S_IRGRP) ? 'r' : '-';
+                p[5] = (st.st_mode & S_IWGRP) ? 'w' : '-';
+                p[6] = (st.st_mode & S_IXGRP) ? 'x' : '-';
+                p[7] = (st.st_mode & S_IROTH) ? 'r' : '-';
+                p[8] = (st.st_mode & S_IWOTH) ? 'w' : '-';
+                p[9] = (st.st_mode & S_IXOTH) ? 'x' : '-';
+                p[10] = '\0';
+                perms = [NSString stringWithUTF8String:p];
+
+                if (isSymlink) {
+                    struct stat tst;
+                    if (stat(fullPath, &tst) == 0) {
+                        isDir = S_ISDIR(tst.st_mode);
+                    }
+                }
+            } else {
+                if (entry->d_type == DT_DIR) isDir = YES;
+            }
+
+            NSString *fullPathStr = [NSString stringWithUTF8String:fullPath];
+            [results addObject:@{
+                @"name": name,
+                @"path": fullPathStr ?: name,
+                @"isDir": @(isDir),
+                @"size": @(size),
+                @"modified": @(modTime),
+                @"perms": perms,
+                @"isHidden": @(isHidden),
+                @"isSymlink": @(isSymlink),
+            }];
+        }
+        closedir(dp);
+
+        NSLog(@"[FD] FDListDirectoryRaw(%s): %lu entries", dirPath, (unsigned long)results.count);
+        pthread_mutex_unlock(&sEngineMutex);
+        return results;
+
+    } @catch (NSException *e) {
+        NSLog(@"[FD] FDListDirectoryRaw EXCEPTION for %s: %@", dirPath, e);
         pthread_mutex_unlock(&sEngineMutex);
         return @[];
     }
-
-    NSMutableArray *results = [NSMutableArray array];
-    struct dirent *entry;
-    while ((entry = readdir(dp)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-        NSString *name = [NSString stringWithUTF8String:entry->d_name];
-        if (!name) continue;
-
-        char fullPath[2048];
-        snprintf(fullPath, sizeof(fullPath), "%s/%s", dirPath, entry->d_name);
-
-        struct stat st;
-        BOOL didStat = (lstat(fullPath, &st) == 0);
-
-        BOOL isDir = NO;
-        uint64_t size = 0;
-        double modTime = 0;
-        NSString *perms = @"?";
-        BOOL isHidden = (entry->d_name[0] == '.');
-        BOOL isSymlink = NO;
-
-        if (didStat) {
-            isDir = S_ISDIR(st.st_mode);
-            isSymlink = S_ISLNK(st.st_mode);
-            size = (uint64_t)st.st_size;
-            modTime = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
-
-            char p[11];
-            p[0] = S_ISDIR(st.st_mode) ? 'd' : S_ISLNK(st.st_mode) ? 'l' : '-';
-            p[1] = (st.st_mode & S_IRUSR) ? 'r' : '-';
-            p[2] = (st.st_mode & S_IWUSR) ? 'w' : '-';
-            p[3] = (st.st_mode & S_IXUSR) ? 'x' : '-';
-            p[4] = (st.st_mode & S_IRGRP) ? 'r' : '-';
-            p[5] = (st.st_mode & S_IWGRP) ? 'w' : '-';
-            p[6] = (st.st_mode & S_IXGRP) ? 'x' : '-';
-            p[7] = (st.st_mode & S_IROTH) ? 'r' : '-';
-            p[8] = (st.st_mode & S_IWOTH) ? 'w' : '-';
-            p[9] = (st.st_mode & S_IXOTH) ? 'x' : '-';
-            p[10] = '\0';
-            perms = [NSString stringWithUTF8String:p];
-
-            // If symlink, also stat the target to check if it's a dir
-            if (isSymlink) {
-                struct stat tst;
-                if (stat(fullPath, &tst) == 0) {
-                    isDir = S_ISDIR(tst.st_mode);
-                }
-            }
-        } else {
-            if (entry->d_type == DT_DIR) isDir = YES;
-        }
-
-        NSString *fullPathStr = [NSString stringWithUTF8String:fullPath];
-        [results addObject:@{
-            @"name": name,
-            @"path": fullPathStr ?: name,
-            @"isDir": @(isDir),
-            @"size": @(size),
-            @"modified": @(modTime),
-            @"perms": perms,
-            @"isHidden": @(isHidden),
-            @"isSymlink": @(isSymlink),
-        }];
-    }
-    closedir(dp);
-
-    NSLog(@"[FD] FDListDirectoryRaw(%s): %lu entries (incl hidden)", dirPath, (unsigned long)results.count);
-    pthread_mutex_unlock(&sEngineMutex);
-    return results;
 }
 
 NSArray<NSDictionary *> *FDProbeAccessiblePaths(void) {

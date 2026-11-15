@@ -95,12 +95,14 @@ enum FileAccessBridge {
             }.sorted()
         }
 
+        // Fallback: try FileManager (may work for bundle paths and sandbox-accessible dirs)
         let fm = FileManager.default
-        if let entries = try? fm.contentsOfDirectory(atPath: path) {
+        if let entries = try? fm.contentsOfDirectory(atPath: path), !entries.isEmpty {
             return entries.compactMap { name in
                 fileNode(name: name, parentPath: path)
             }.sorted()
         }
+
         NSLog("[FD] listDirectory FAILED: %@", path)
         return []
     }
