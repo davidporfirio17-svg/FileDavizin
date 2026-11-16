@@ -9,7 +9,6 @@ final class AppsViewController: UIViewController {
     private let spinner = UIActivityIndicatorView(style: .medium)
     private var isScanning = false
     private var statusObserver: NSObjectProtocol?
-    private var searchDebounce: DispatchWorkItem?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -151,10 +150,12 @@ final class AppsViewController: UIViewController {
                             if let idx = self.allContainers.firstIndex(where: { $0.identifier == ident }) {
                                 self.allContainers[idx].cachedSize = size
                             }
-                            if let visIdx = self.filteredContainers.firstIndex(where: { $0.identifier == ident }) {
+                            if let visIdx = self.filteredContainers.firstIndex(where: { $0.identifier == ident }),
+                               visIdx < self.filteredContainers.count {
                                 self.filteredContainers[visIdx].cachedSize = size
                                 let ip = IndexPath(item: visIdx, section: 0)
-                                if let cell = self.collectionView.cellForItem(at: ip) as? AppCell {
+                                if self.collectionView.numberOfItems(inSection: 0) > visIdx,
+                                   let cell = self.collectionView.cellForItem(at: ip) as? AppCell {
                                     cell.configure(with: self.filteredContainers[visIdx])
                                 }
                             }
@@ -195,7 +196,9 @@ extension AppsViewController: UICollectionViewDataSource {
 
     func collectionView(_ cv: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
         let cell = cv.dequeueReusableCell(withReuseIdentifier: AppCell.reuseID, for: indexPath) as! AppCell
-        cell.configure(with: filteredContainers[indexPath.item])
+        if indexPath.item < filteredContainers.count {
+            cell.configure(with: filteredContainers[indexPath.item])
+        }
         return cell
     }
 }
@@ -203,6 +206,7 @@ extension AppsViewController: UICollectionViewDataSource {
 extension AppsViewController: UICollectionViewDelegate {
     func collectionView(_ cv: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         cv.deselectItem(at: indexPath, animated: true)
+        guard indexPath.item < filteredContainers.count else { return }
         let container = filteredContainers[indexPath.item]
         let detail = AppDetailViewController(container: container)
         navigationController?.pushViewController(detail, animated: true)
@@ -211,15 +215,10 @@ extension AppsViewController: UICollectionViewDelegate {
 
 extension AppsViewController: UISearchBarDelegate {
     func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-        searchDebounce?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.applyFilter() }
-        searchDebounce = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        applyFilter()
     }
 
     func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
-        searchDebounce?.cancel()
-        applyFilter()
         searchBar.resignFirstResponder()
     }
 }
