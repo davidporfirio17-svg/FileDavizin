@@ -2067,6 +2067,9 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *_scanAllContainers(NSUIn
     return results;
 }
 
+static void _tryMobileInstallLookup(void);
+static void _tryPopulateFromInstalldFiles(void);
+
 NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limit) {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *results = [NSMutableArray array];
     NSMutableSet<NSString *> *seen = [NSMutableSet set];
