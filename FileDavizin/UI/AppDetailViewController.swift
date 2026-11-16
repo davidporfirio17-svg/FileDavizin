@@ -204,12 +204,12 @@ final class AppDetailViewController: UITableViewController {
     // MARK: - Helpers
 
     private func iconBackgroundColor() -> UIColor {
-        let hue = CGFloat(abs(container.identifier.hashValue) % 360) / 360.0
+        let hue = CGFloat((container.identifier.hashValue & 0x7FFFFFFF) % 360) / 360.0
         return UIColor(hue: hue, saturation: 0.55, brightness: 0.30, alpha: 1)
     }
 
     private func iconForegroundColor() -> UIColor {
-        let hue = CGFloat(abs(container.identifier.hashValue) % 360) / 360.0
+        let hue = CGFloat((container.identifier.hashValue & 0x7FFFFFFF) % 360) / 360.0
         return UIColor(hue: hue, saturation: 0.40, brightness: 0.90, alpha: 1)
     }
 }

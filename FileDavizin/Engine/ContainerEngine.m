@@ -270,7 +270,7 @@ typedef int64_t (*SBXExtConsumeFunc)(const char *);
 typedef int (*SBXExtReleaseFunc)(int64_t);
 
 static int sPartOneFailCount = 0;
-#define PART1_FAIL_THRESHOLD 3
+#define PART1_FAIL_THRESHOLD 50
 
 static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
     if (!targetPath || targetPath[0] != '/') return -1;
@@ -300,6 +300,7 @@ static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
         static int sKnownGoodFlag[2] = {-1, -1};
         static int sKnownGoodGroup[2] = {-1, -1};
         int ci = (part == 1) ? 0 : 1;
+        BOOL anyHandleConsumed = NO;
 
         SBXExtReleaseFunc releaseExt = (SBXExtReleaseFunc)dlsym(RTLD_DEFAULT,
                                                                  "sandbox_extension_release");
@@ -393,6 +394,7 @@ static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
                 api->queryFree(q);
 
                 if (handle >= 0) {
+                    anyHandleConsumed = YES;
                     int fd = open(targetPath, O_RDONLY | O_CLOEXEC);
                     if (fd >= 0) {
                         close(fd);
@@ -407,18 +409,22 @@ static int64_t _worseQuerySymlinkWithPart(const char *targetPath, int part) {
                     int openErrno = errno;
                     NSLog(@"[FD-SYM] g[%d] f=%d p=%d handle=%lld but open errno=%d %s",
                           g, fi, part, (long long)handle, openErrno, targetPath);
-                    if (releaseExt) releaseExt(handle);
                     if (openErrno == ENOENT) {
+                        if (releaseExt) releaseExt(handle);
                         close(libraryFd);
                         return -1;
                     }
+                    // EPERM/EACCES: keep sandbox extension consumed — don't release.
+                    // The process-wide extension accumulates and may help opendir later.
+                    NSLog(@"[FD-SYM] keeping ext handle=%lld active for %s (errno=%d)",
+                          (long long)handle, targetPath, openErrno);
                 }
             }
 
             close(libraryFd);
         }
 
-        if (part == 1) sPartOneFailCount++;
+        if (part == 1 && !anyHandleConsumed) sPartOneFailCount++;
         return -1;
     }
     } @finally {
@@ -2238,7 +2244,7 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
                     bpFromCache++;
                     continue;
                 }
-                if (bpMCMConsecFails >= 20) continue;
+                if (bpMCMConsecFails >= 100) continue;
                 bp = _mcmResolveBundlePath(bid);
                 if (bp) {
                     [(NSMutableDictionary *)dict setObject:bp forKey:@"bundlePath"];
@@ -2458,16 +2464,18 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
 
     // Method 4: Bulk scan /private/var/containers/Bundle/Application/
     @try {
-        static dispatch_once_t sBundleScanOnce;
-        __block NSUInteger scanFound = 0;
-        dispatch_once(&sBundleScanOnce, ^{
+        static int sBundleScanCount = 0;
+        static NSUInteger sLastScanFound = 0;
+        // Allow up to 3 scan attempts if previous scans found nothing
+        if (sBundleScanCount == 0 || (sBundleScanCount < 3 && sLastScanFound == 0)) {
+            sBundleScanCount++;
             static NSString *const kBundleBase = @"/private/var/containers/Bundle/Application";
             _worseQuerySymlink(kBundleBase.UTF8String);
             FDGrantAccessSafe(kBundleBase.UTF8String);
             NSFileManager *fm = [NSFileManager defaultManager];
             NSArray *entries = [fm contentsOfDirectoryAtPath:kBundleBase error:nil];
-            NSLog(@"[FD-BNDL] M4 scan: opendir Bundle/Application → %lu entries",
-                  (unsigned long)entries.count);
+            NSLog(@"[FD-BNDL] M4 scan #%d: opendir Bundle/Application → %lu entries",
+                  sBundleScanCount, (unsigned long)entries.count);
             NSUInteger found = 0;
             for (NSString *uuid in entries) {
                 @autoreleasepool {
@@ -2481,6 +2489,7 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                         FDGrantAccessSafe(uuidDir.UTF8String);
                         appEntries = [fm contentsOfDirectoryAtPath:uuidDir error:nil];
                     }
+                    // If opendir succeeded, look for .app entries
                     for (NSString *entry in appEntries) {
                         if (![entry hasSuffix:@".app"]) continue;
                         NSString *plistPath = [[uuidDir stringByAppendingPathComponent:entry]
@@ -2498,11 +2507,31 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                             pthread_mutex_unlock(&sEngineMutex);
                         }
                     }
+                    // Fallback: if opendir failed, try reading metadata plist directly
+                    if (!appEntries.count) {
+                        NSString *metaPath = [uuidDir stringByAppendingPathComponent:
+                            @".com.apple.mobile_container_manager.metadata.plist"];
+                        _worseQuerySymlink(metaPath.UTF8String);
+                        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPath];
+                        NSString *bid = meta[@"MCMMetadataIdentifier"];
+                        if (bid.length > 0) {
+                            pthread_mutex_lock(&sEngineMutex);
+                            if (!sCSStoreBIDToBundlePath)
+                                sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+                            if (![sCSStoreBIDToBundlePath objectForKey:bid]) {
+                                [sCSStoreBIDToBundlePath setObject:uuidDir forKey:bid];
+                                found++;
+                            }
+                            pthread_mutex_unlock(&sEngineMutex);
+                            NSLog(@"[FD-BNDL] M4 metadata fallback: %@ → %@", bid, uuidDir);
+                        }
+                    }
                 }
             }
-            scanFound = found;
-            NSLog(@"[FD-BNDL] M4 scan complete: %lu bundle paths found", (unsigned long)found);
-        });
+            sLastScanFound += found;
+            NSLog(@"[FD-BNDL] M4 scan #%d complete: %lu new paths (total=%lu)",
+                  sBundleScanCount, (unsigned long)found, (unsigned long)sLastScanFound);
+        }
         // Re-check cache after bulk scan
         pthread_mutex_lock(&sEngineMutex);
         NSString *cachedPath = sCSStoreBIDToBundlePath
@@ -2512,7 +2541,7 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
             NSLog(@"[FD-BNDL] %@ → M4(scan) = %@", bundleID, cachedPath);
             return cachedPath;
         }
-        NSLog(@"[FD-BNDL] %@ M4(scan) miss (scanned=%lu)", bundleID, (unsigned long)scanFound);
+        NSLog(@"[FD-BNDL] %@ M4(scan) miss (total=%lu)", bundleID, (unsigned long)sLastScanFound);
     } @catch (NSException *e) {
         NSLog(@"[FD-BNDL] %@ M4(scan) exception: %@", bundleID, e);
     }
@@ -3180,6 +3209,76 @@ NSArray<NSDictionary *> *FDListDirectoryRaw(const char *dirPath) {
         }
 
         if (!dp) {
+            // Last resort for bundle dirs: probe known file names and use NSBundle
+            if (strstr(dirPath, ".app") || strstr(dirPath, "/Bundle/Application")) {
+                @try {
+                    NSString *dirStr = [NSString stringWithUTF8String:dirPath];
+                    NSMutableArray *probed = [NSMutableArray array];
+
+                    // Strategy A: NSBundle resource enumeration
+                    NSBundle *bundle = [NSBundle bundleWithPath:dirStr];
+                    if (bundle) {
+                        NSArray *resources = [bundle pathsForResourcesOfType:nil inDirectory:nil];
+                        for (NSString *res in resources) {
+                            struct stat rst;
+                            if (lstat(res.fileSystemRepresentation, &rst) == 0) {
+                                NSString *name = [res lastPathComponent];
+                                [probed addObject:@{
+                                    @"name": name,
+                                    @"path": res,
+                                    @"isDir": @(S_ISDIR(rst.st_mode)),
+                                    @"size": @((uint64_t)rst.st_size),
+                                    @"modified": @((double)rst.st_mtimespec.tv_sec),
+                                    @"perms": @"-",
+                                    @"isHidden": @(name.length > 0 && [name hasPrefix:@"."]),
+                                    @"isSymlink": @(S_ISLNK(rst.st_mode)),
+                                }];
+                            }
+                        }
+                        if (probed.count) {
+                            NSLog(@"[FD] ListDir NSBundle: %lu entries for %s",
+                                  (unsigned long)probed.count, dirPath);
+                            return probed;
+                        }
+                    }
+
+                    // Strategy B: probe known bundle file/dir names via stat
+                    static const char *kKnownNames[] = {
+                        "Info.plist", "_CodeSignature", "embedded.mobileprovision",
+                        "PkgInfo", "Assets.car", "Frameworks", "PlugIns",
+                        "SC_Info", "Base.lproj", "en.lproj", "es.lproj",
+                        "ResourceRules.plist", "archived-expanded-entitlements.xcent",
+                    };
+                    for (int k = 0; k < (int)(sizeof(kKnownNames)/sizeof(kKnownNames[0])); k++) {
+                        char probePath[2048];
+                        snprintf(probePath, sizeof(probePath), "%s/%s", dirPath, kKnownNames[k]);
+                        _worseQuerySymlink(probePath);
+                        struct stat pst;
+                        if (lstat(probePath, &pst) == 0) {
+                            NSString *name = [NSString stringWithUTF8String:kKnownNames[k]];
+                            NSString *fullPathStr = [NSString stringWithUTF8String:probePath];
+                            [probed addObject:@{
+                                @"name": name,
+                                @"path": fullPathStr,
+                                @"isDir": @(S_ISDIR(pst.st_mode)),
+                                @"size": @((uint64_t)pst.st_size),
+                                @"modified": @((double)pst.st_mtimespec.tv_sec),
+                                @"perms": @"-",
+                                @"isHidden": @([name hasPrefix:@"."]),
+                                @"isSymlink": @(S_ISLNK(pst.st_mode)),
+                            }];
+                        }
+                    }
+                    if (probed.count) {
+                        NSLog(@"[FD] ListDir probed: %lu known entries for %s",
+                              (unsigned long)probed.count, dirPath);
+                        return probed;
+                    }
+                } @catch (NSException *e) {
+                    NSLog(@"[FD] ListDir bundle-probe exception: %@", e);
+                }
+            }
+
             NSLog(@"[FD] FDListDirectoryRaw: opendir(%s) FAILED: %s", dirPath, strerror(errno));
             return @[];
         }
