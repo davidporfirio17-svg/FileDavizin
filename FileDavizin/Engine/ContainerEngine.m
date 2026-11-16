@@ -2224,8 +2224,10 @@ NSArray<NSDictionary<NSString *, NSString *> *> *FDEnumerateApps(NSUInteger limi
         }
     }
 
-    // Pass 4: Enrich with bundle paths (csstore cache + MCM class-2 part=1)
+    // Pass 4: Enrich with bundle paths (MI + installd + csstore cache + MCM class-2 part=1)
     {
+        _tryMobileInstallLookup();
+        _tryPopulateFromInstalldFiles();
         pthread_mutex_lock(&sEngineMutex);
         NSDictionary *bundlePathMap = sCSStoreBIDToBundlePath
             ? [[sCSStoreBIDToBundlePath copy] autorelease] : @{};
@@ -2364,9 +2366,119 @@ NSString *FDDiscoverContainerPath(NSString *bundleID) {
     return nil;
 }
 
+#pragma mark - MobileInstallation helpers
+
+static void _tryMobileInstallLookup(void) {
+    static dispatch_once_t sOnce;
+    dispatch_once(&sOnce, ^{
+        @try {
+            void *miHandle = dlopen("/System/Library/PrivateFrameworks/"
+                                    "MobileInstallation.framework/MobileInstallation",
+                                    RTLD_LAZY);
+            if (!miHandle) {
+                NSLog(@"[FD-MI] dlopen FAIL: %s", dlerror());
+                return;
+            }
+            typedef CFDictionaryRef (*MILookup_t)(CFDictionaryRef);
+            MILookup_t miLookup = (MILookup_t)dlsym(miHandle, "MobileInstallationLookup");
+            if (!miLookup) {
+                NSLog(@"[FD-MI] dlsym MobileInstallationLookup FAIL");
+                return;
+            }
+            NSArray *attrs = [NSArray arrayWithObjects:@"Path", @"BundleContainer",
+                              @"Container", @"CFBundleIdentifier", nil];
+            NSDictionary *opts = [NSDictionary dictionaryWithObject:attrs
+                                                            forKey:@"ReturnAttributes"];
+            CFDictionaryRef raw = miLookup((__bridge CFDictionaryRef)opts);
+            if (!raw) {
+                NSLog(@"[FD-MI] Lookup returned NULL");
+                return;
+            }
+            NSDictionary *all = (__bridge NSDictionary *)raw;
+            NSLog(@"[FD-MI] Lookup OK: %lu apps", (unsigned long)all.count);
+            int added = 0;
+            _ensureEngineMutex();
+            pthread_mutex_lock(&sEngineMutex);
+            if (!sCSStoreBIDToBundlePath)
+                sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+            for (NSString *bid in all) {
+                if ([sCSStoreBIDToBundlePath objectForKey:bid]) continue;
+                NSDictionary *info = all[bid];
+                if (![info isKindOfClass:[NSDictionary class]]) continue;
+                NSString *bp = info[@"BundleContainer"];
+                if (!bp.length) bp = info[@"Path"];
+                if (!bp.length) continue;
+                if ([bp hasPrefix:@"/var/"])
+                    bp = [@"/private" stringByAppendingString:bp];
+                if ([bp hasSuffix:@".app"])
+                    bp = [bp stringByDeletingLastPathComponent];
+                [sCSStoreBIDToBundlePath setObject:bp forKey:bid];
+                added++;
+            }
+            pthread_mutex_unlock(&sEngineMutex);
+            NSLog(@"[FD-MI] Added %d new bundle paths to cache", added);
+        } @catch (NSException *e) {
+            NSLog(@"[FD-MI] exception: %@", e);
+        }
+    });
+}
+
+static void _tryPopulateFromInstalldFiles(void) {
+    static dispatch_once_t sOnce;
+    dispatch_once(&sOnce, ^{
+        @try {
+            static const char *kPaths[] = {
+                "/private/var/installd/Library/MobileInstallation/MobileInstallation.plist",
+                "/private/var/installd/Library/MobileInstallation/LastLaunchServicesMap.plist",
+                "/private/var/MobileDevice/ProvisioningProfiles",
+            };
+            int np = sizeof(kPaths) / sizeof(kPaths[0]);
+            for (int pi = 0; pi < np; pi++) {
+                NSString *path = [NSString stringWithUTF8String:kPaths[pi]];
+                NSString *parentDir = [path stringByDeletingLastPathComponent];
+                _worseQuerySymlink(parentDir.fileSystemRepresentation);
+                FDGrantAccessSafe(parentDir.fileSystemRepresentation);
+                _worseQuerySymlink(path.fileSystemRepresentation);
+                NSDictionary *db = [NSDictionary dictionaryWithContentsOfFile:path];
+                if (!db.count) continue;
+                NSLog(@"[FD-INST] Read %@ OK: %lu top-keys", path, (unsigned long)db.count);
+                int added = 0;
+                _ensureEngineMutex();
+                pthread_mutex_lock(&sEngineMutex);
+                if (!sCSStoreBIDToBundlePath)
+                    sCSStoreBIDToBundlePath = [[NSMutableDictionary alloc] init];
+                for (NSString *category in @[@"User", @"System", @"Internal"]) {
+                    NSDictionary *apps = db[category];
+                    if (![apps isKindOfClass:[NSDictionary class]]) continue;
+                    for (NSString *bid in apps) {
+                        if ([sCSStoreBIDToBundlePath objectForKey:bid]) continue;
+                        NSDictionary *info = apps[bid];
+                        if (![info isKindOfClass:[NSDictionary class]]) continue;
+                        NSString *bp = info[@"Path"];
+                        if (!bp.length) bp = info[@"BundleContainer"];
+                        if (!bp.length) continue;
+                        if ([bp hasPrefix:@"/var/"])
+                            bp = [@"/private" stringByAppendingString:bp];
+                        if ([bp hasSuffix:@".app"])
+                            bp = [bp stringByDeletingLastPathComponent];
+                        [sCSStoreBIDToBundlePath setObject:bp forKey:bid];
+                        added++;
+                    }
+                }
+                pthread_mutex_unlock(&sEngineMutex);
+                NSLog(@"[FD-INST] Added %d new bundle paths from %@", added, path);
+                if (added > 0) break;
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[FD-INST] exception: %@", e);
+        }
+    });
+}
+
 #pragma mark - FDResolveBundlePath
 
 NSString *FDResolveBundlePath(NSString *bundleID) {
+    NSLog(@"[FD-BNDL] >>> ENTER bid=%@", bundleID);
     if (!bundleID.length) return nil;
 
     // Method 1: csstore reverse mapping (fastest, thread-safe read)
@@ -2382,6 +2494,34 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
     }
     pthread_mutex_unlock(&sEngineMutex);
     NSLog(@"[FD-BNDL] %@ M1(csstore) miss", bundleID);
+
+    // Method 1b: MobileInstallation framework (populates cache for ALL apps)
+    _tryMobileInstallLookup();
+    pthread_mutex_lock(&sEngineMutex);
+    if (sCSStoreBIDToBundlePath) {
+        NSString *path = [sCSStoreBIDToBundlePath objectForKey:bundleID];
+        if (path) {
+            pthread_mutex_unlock(&sEngineMutex);
+            NSLog(@"[FD-BNDL] %@ → M1b(MI) = %@", bundleID, path);
+            return path;
+        }
+    }
+    pthread_mutex_unlock(&sEngineMutex);
+    NSLog(@"[FD-BNDL] %@ M1b(MI) miss", bundleID);
+
+    // Method 1c: installd database files (populates cache for ALL apps)
+    _tryPopulateFromInstalldFiles();
+    pthread_mutex_lock(&sEngineMutex);
+    if (sCSStoreBIDToBundlePath) {
+        NSString *path = [sCSStoreBIDToBundlePath objectForKey:bundleID];
+        if (path) {
+            pthread_mutex_unlock(&sEngineMutex);
+            NSLog(@"[FD-BNDL] %@ → M1c(installd) = %@", bundleID, path);
+            return path;
+        }
+    }
+    pthread_mutex_unlock(&sEngineMutex);
+    NSLog(@"[FD-BNDL] %@ M1c(installd) miss", bundleID);
 
     // Method 2: LSApplicationProxy (no mutex needed, runtime API)
     @try {
@@ -2399,6 +2539,14 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                         if (bundleURL)
                             bundleURL = [bundleURL URLByDeletingLastPathComponent];
                     }
+                    if (!bundleURL && [proxy respondsToSelector:@selector(resourcesDirectoryURL)])
+                        bundleURL = [proxy performSelector:@selector(resourcesDirectoryURL)];
+                    if (!bundleURL && [proxy respondsToSelector:@selector(executableURL)]) {
+                        NSURL *execURL = [proxy performSelector:@selector(executableURL)];
+                        if (execURL)
+                            bundleURL = [[execURL URLByDeletingLastPathComponent]
+                                         URLByDeletingLastPathComponent];
+                    }
                     if (bundleURL) {
                         NSString *path = bundleURL.path;
                         if ([path hasPrefix:@"/var/"])
@@ -2413,7 +2561,13 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
                             return path;
                         }
                     }
-                    NSLog(@"[FD-BNDL] %@ M2(LSProxy) proxy exists but no URL", bundleID);
+                    NSLog(@"[FD-BNDL] %@ M2(LSProxy) proxy exists but no URL"
+                          @" (bundleContainerURL=%d bundleURL=%d resDir=%d execURL=%d)",
+                          bundleID,
+                          [proxy respondsToSelector:@selector(bundleContainerURL)],
+                          [proxy respondsToSelector:@selector(bundleURL)],
+                          [proxy respondsToSelector:@selector(resourcesDirectoryURL)],
+                          [proxy respondsToSelector:@selector(executableURL)]);
                 }
             }
         }
@@ -2546,7 +2700,8 @@ NSString *FDResolveBundlePath(NSString *bundleID) {
         NSLog(@"[FD-BNDL] %@ M4(scan) exception: %@", bundleID, e);
     }
 
-    NSLog(@"[FD-BNDL] %@ ALL METHODS FAILED", bundleID);
+    NSLog(@"[FD-BNDL] <<< EXIT %@ ALL METHODS FAILED (cache=%lu)",
+          bundleID, (unsigned long)(sCSStoreBIDToBundlePath ? sCSStoreBIDToBundlePath.count : 0));
     return nil;
 }
 

@@ -172,13 +172,17 @@ final class AppDetailViewController: UITableViewController {
                 path: container.path, title: container.displayName)
             navigationController?.pushViewController(browser, animated: true)
         } else {
+            NSLog("[FD-UI] Paquete tapped bid=%@ existing=%@",
+                  container.identifier, container.bundlePath ?? "nil")
             if let bp = container.bundlePath, !bp.isEmpty {
+                NSLog("[FD-UI] Navigating to cached bundlePath=%@", bp)
                 let browser = FileBrowserViewController(
                     path: bp, title: "Bundle — \(container.displayName)")
                 navigationController?.pushViewController(browser, animated: true)
             } else {
                 let cell = tableView.cellForRow(at: indexPath)
                 cell?.detailTextLabel?.text = "Resolviendo..."
+                NSLog("[FD-UI] Resolving bundle for %@...", container.identifier)
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self else { return }
                     let bp = FileAccessBridge.resolveBundlePath(bundleID: self.container.identifier)

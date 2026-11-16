@@ -52,10 +52,18 @@ enum FileAccessBridge {
     }
 
     static func resolveBundlePath(bundleID: String) -> String? {
+        NSLog("[FD-BRIDGE] resolveBundlePath ENTER bid=%@", bundleID)
         var result: String?
-        FDTryObjC({
+        var exc: NSException?
+        let ok = FDTryObjC({
             result = FDResolveBundlePath(bundleID)
-        }, nil)
+        }, &exc)
+        if !ok {
+            NSLog("[FD-BRIDGE] resolveBundlePath EXCEPTION bid=%@ reason=%@",
+                  bundleID, exc?.reason ?? "unknown")
+        }
+        NSLog("[FD-BRIDGE] resolveBundlePath EXIT bid=%@ result=%@ ok=%d",
+              bundleID, result ?? "nil", ok ? 1 : 0)
         return result
     }
 
